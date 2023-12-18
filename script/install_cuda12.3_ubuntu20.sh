@@ -27,3 +27,28 @@ echo "[INFO] install driver..."
 sudo apt-get install -y nvidia-kernel-open-545
 sudo apt-get install -y cuda-drivers-545
 echo "[INFO] done installing the driver."
+
+echo "[INFO] install zlib..."
+sudo apt-get install zlib1g
+echo "[INFO] done installation of zlib."
+
+echo "[INFO] Download cuDNN."
+echo "[INFO] Did you finish downloading cuDNN from: https://developer.nvidia.com/rdp/cudnn-download ?"
+select yn in "Yes" "No"; do
+    case $yn in
+	Yes ) break;;
+	No ) echo "Please download it."
+	     exit;;
+    esac
+done
+
+echo "[INFO] install cuDNN..."
+cudnn_version=8.9.7.29
+cuda_version=cuda12.3
+sudo dpkg -i ~/Downloads/cudnn-local-repo-ubuntu2004-${cudnn_version}_1.0-1_amd64.deb
+cudnn-local-repo-ubuntu2004-${cudnn_version}_1.0-1_amd64.deb
+sudo apt-get update
+sudo apt-get install libcudnn8=${cudnn_version}-1.${cuda_version}
+sudo apt-get install libcudnn8-dev=${cudnn_version}-1.${cuda_version}
+sudo apt-get install libcudnn8-samples=${cudnn_version}-1.${cuda_version}
+echo "[INFO] done."
