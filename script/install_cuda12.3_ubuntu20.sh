@@ -4,6 +4,7 @@
 # Reference:
 #   https://qiita.com/cinchan/items/9718e1f26146dc5e3eaa
 #   https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_local
+#   https://qiita.com/Manyan3/items/628b3b22700fd569e8fb
 ###
 
 echo "[INFO] remove existing cuda to avoid compatible issues..."
@@ -43,12 +44,21 @@ select yn in "Yes" "No"; do
 done
 
 echo "[INFO] install cuDNN..."
+distro=ubuntu2004
 cudnn_version=8.9.7.29
-cuda_version=cuda12.3
-sudo dpkg -i ~/Downloads/cudnn-local-repo-ubuntu2004-${cudnn_version}_1.0-1_amd64.deb
-cudnn-local-repo-ubuntu2004-${cudnn_version}_1.0-1_amd64.deb
+# notice! cuda bug! we need installed cuda version-1 for cudnn.
+cuda_version=cuda12.2
+sudo dpkg -i ~/Downloads/cudnn-local-repo-$distro-${cudnn_version}_1.0-1_amd64.deb
+sudo cp /var/cudnn-local-repo-*/cudnn-local-*-keyring.gpg /usr/share/keyrings/
 sudo apt-get update
-sudo apt-get install libcudnn8=${cudnn_version}-1.${cuda_version}
-sudo apt-get install libcudnn8-dev=${cudnn_version}-1.${cuda_version}
-sudo apt-get install libcudnn8-samples=${cudnn_version}-1.${cuda_version}
+sudo apt-get install libcudnn8=${cudnn_version}-1+${cuda_version}
+sudo apt-get install libcudnn8-dev=${cudnn_version}-1+${cuda_version}
+sudo apt-get install libcudnn8-samples=${cudnn_version}-1+${cuda_version}
 echo "[INFO] done."
+
+echo "[INFO] verifying cudnn installation..."
+cp -r /usr/src/cudnn_samples_v8/ $HOME
+cd  $HOME/cudnn_samples_v8/mnistCUDNN
+make clean && make
+./mnistCUDNN
+echo "[INFO] If you see 'Test passed!', installation successed."
