@@ -6,12 +6,12 @@
 #   https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_local
 ###
 
-# echo "[INFO] remove existing cuda to avoid compatible issues..."
-# sudo apt remove --purge "nvidia-*" -y && sudo apt autoremove
-# sudo apt remove --purge "cuda-*" -y && sudo apt autoremove
-# sudo apt remove --purge "libcudnn*" -y && sudo apt autoremove
-# sudo apt remove --purge "libnvidia-*" -y && sudo apt autoremove
-# echo "[INFO] done removal."
+echo "[INFO] remove existing cuda to avoid compatible issues..."
+sudo apt remove --purge "nvidia-*" -y && sudo apt autoremove
+sudo apt remove --purge "cuda-*" -y && sudo apt autoremove
+sudo apt remove --purge "libcudnn*" -y && sudo apt autoremove
+sudo apt remove --purge "libnvidia-*" -y && sudo apt autoremove
+echo "[INFO] done removal."
 
 echo "[INFO] install base..."
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.pin
