@@ -39,8 +39,6 @@ if [ ! -f ${DEB_FILE} ]; then
 fi
 sudo dpkg -i ${DEB_FILE}
 sudo cp /var/cuda-repo-ubuntu2004-12-4-local/cuda-*-keyring.gpg /usr/share/keyrings/
-# sudo rm -f /etc/apt/sources.list.d/cuda.list
-# sudo rm -f /etc/apt/sources.list.d/nvidia-ml.list
 sudo apt-get update
 sudo apt-get -y install cuda-toolkit-12-4
 sudo apt-get -y install nvidia-driver-550-open
