@@ -13,6 +13,7 @@ set -e
 echo "[INFO] remove existing cuda to avoid compatible issues..."
 sudo apt remove --purge "nvidia-*" -y && sudo apt autoremove -y
 sudo apt remove --purge "cuda-*" -y && sudo apt autoremove -y
+sudo apt remove --purge "cudnn-*" -y && sudo apt autoremove -y
 sudo apt remove --purge "libcudnn*" -y && sudo apt autoremove -y
 sudo apt remove --purge "libnvidia-*" -y && sudo apt autoremove -y
 echo "[INFO] done removal."
@@ -29,12 +30,12 @@ echo "[INFO] done updating GPG key."
 echo "[INFO] install Nvidia driver"
 PIN_FILE=cuda-ubuntu2004.pin
 if [ ! -f ${PIN_FILE} ]; then
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.pin
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/${PIN_FILE}
 fi
 sudo mv ${PIN_FILE} /etc/apt/preferences.d/cuda-repository-pin-600
 DEB_FILE=cuda-repo-ubuntu2004-12-4-local_12.4.1-550.54.15-1_amd64.deb
 if [ ! -f ${DEB_FILE} ]; then
-    wget https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda-repo-ubuntu2004-12-4-local_12.4.1-550.54.15-1_amd64.deb
+    wget https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/${DEB_FILE}
 fi
 sudo dpkg -i ${DEB_FILE}
 sudo cp /var/cuda-repo-ubuntu2004-12-4-local/cuda-*-keyring.gpg /usr/share/keyrings/
