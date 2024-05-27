@@ -1,5 +1,5 @@
 #/bin/bash
-# Explanation: This is a total install script of CUDA12.3 and related libraries to Ubuntu20.04 
+# Explanation: This is a total install script of CUDA12.4 and related libraries to Ubuntu20.04 
 # Author: Masahiro Ogawa
 # Reference:
 #   whole procedure: https://qiita.com/cinchan/items/9718e1f26146dc5e3eaa
