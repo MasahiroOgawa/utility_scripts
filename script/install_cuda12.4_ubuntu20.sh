@@ -43,6 +43,7 @@ sudo apt-get update
 sudo apt-get -y install cuda-toolkit-12-4
 sudo apt-get -y install nvidia-driver-550-open
 sudo apt-get -y install cuda-drivers-550
+echo 'export PATH=/usr/local/cuda-12.4/bin${PATH:+:${PATH}}' >> ~/.bashrc
 echo "[INFO] done driver installation."
 
 echo "[INFO] install cudnn..."
