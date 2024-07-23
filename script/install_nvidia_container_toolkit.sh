@@ -15,3 +15,6 @@ sudo apt-get update
 
 # 3.Install the NVIDIA Container Toolkit packages:
 sudo apt-get install -y nvidia-container-toolkit
+
+# restart docker
+sudo systemctl restart docker
