@@ -33,8 +33,8 @@ sudo apt-get -y update
 sudo apt-get -y install cuda-toolkit-12-6
 sudo apt-get -y install nvidia-driver-560
 sudo apt-get -y install cuda-drivers-560
-echo "export PATH=/usr/local/cuda-12.6/bin${PATH:+:${PATH}}" >> $HOME/.bashrc
-echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $HOME/.bashrc
+echo 'export PATH=/usr/local/cuda-12.6/bin${PATH:+:${PATH}}' >> $HOME/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}' >> $HOME/.bashrc
 echo "[INFO] done CUDA Toolkit installation."
 
 echo "[INFO] install cuDNN..."
