@@ -6,7 +6,7 @@ TRASH_DIR=$HOME/trash
 
 # define function to use trash command
 function trash(){
-    sudo mv --backup --suffix=.$(date +%Y%m%d_%H%M%S) -f "$@" $TRASH_DIR/ ;
+    mv --backup --suffix=.$(date +%Y%m%d_%H%M%S) -f "$@" $TRASH_DIR/ ;
 }
 
 # run
