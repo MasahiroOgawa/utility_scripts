@@ -11,4 +11,4 @@ function trash(){
 
 # run
 mkdir -p $TRASH_DIR
-trash $@
+trash "$@"
