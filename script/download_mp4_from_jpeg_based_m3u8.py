@@ -4,6 +4,7 @@ import sys
 import argparse
 import subprocess
 import glob
+import shutil
 
 def download_jpeg_segments(m3u8_file_path, base_url, output_directory):
     """
@@ -76,9 +77,154 @@ def download_jpeg_segments(m3u8_file_path, base_url, output_directory):
     
     return True
 
+def validate_and_fix_jpegs(input_dir):
+    """
+    Validate JPEG files and remove/fix corrupted ones (optimized for large file counts)
+    
+    Args:
+        input_dir: Directory containing JPEG files
+        
+    Returns:
+        tuple: (valid_count, removed_count)
+    """
+    jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
+    jpeg_files = sorted(glob.glob(jpeg_pattern))
+    
+    valid_count = 0
+    removed_count = 0
+    total_files = len(jpeg_files)
+    
+    print(f"Validating {total_files} JPEG files...")
+    
+    for i, jpeg_file in enumerate(jpeg_files):
+        # Progress indicator for large file counts
+        if i % 100 == 0:
+            print(f"Progress: {i}/{total_files} files processed...")
+            
+        is_valid = True
+        
+        try:
+            # Check file size first - very small files are likely corrupted
+            file_size = os.path.getsize(jpeg_file)
+            if file_size < 512:  # Less than 512 bytes is definitely corrupted
+                print(f"Removing tiny file: {os.path.basename(jpeg_file)} ({file_size} bytes)")
+                os.remove(jpeg_file)
+                removed_count += 1
+                continue
+            
+            # Quick JPEG magic bytes check
+            with open(jpeg_file, 'rb') as f:
+                header = f.read(4)
+                if not header.startswith(b'\xff\xd8\xff'):
+                    print(f"Removing file with invalid JPEG header: {os.path.basename(jpeg_file)}")
+                    os.remove(jpeg_file)
+                    removed_count += 1
+                    continue
+                    
+                # Check for JPEG end marker at the end of file
+                f.seek(-2, 2)  # Go to last 2 bytes
+                footer = f.read(2)
+                if footer != b'\xff\xd9':
+                    print(f"Removing incomplete JPEG file: {os.path.basename(jpeg_file)}")
+                    os.remove(jpeg_file)
+                    removed_count += 1
+                    continue
+            
+            # Light validation - just check file headers without PIL
+            try:
+                # Just check if we can read the file as binary
+                with open(jpeg_file, 'rb') as f:
+                    # Read enough bytes to check basic structure
+                    data = f.read(1024)  # Read first 1KB
+                    if len(data) > 500:  # Basic size check
+                        is_valid = True
+            except Exception:
+                print(f"Removing unreadable file: {os.path.basename(jpeg_file)}")
+                is_valid = False
+            
+            if is_valid:
+                valid_count += 1
+                
+        except Exception as e:
+            print(f"Removing problematic file: {os.path.basename(jpeg_file)} - {e}")
+            is_valid = False
+        
+        if not is_valid:
+            try:
+                os.remove(jpeg_file)
+                removed_count += 1
+            except OSError:
+                pass  # File might already be removed
+    
+    print(f"Validation complete: {valid_count} valid, {removed_count} removed")
+    return valid_count, removed_count
+
+def ffmpeg_validate_jpegs(input_dir):
+    """
+    Use ffmpeg to validate JPEG files - more thorough than PIL (optimized for large file counts)
+    
+    Args:
+        input_dir: Directory containing JPEG files
+        
+    Returns:
+        tuple: (valid_count, removed_count)
+    """
+    jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
+    jpeg_files = sorted(glob.glob(jpeg_pattern))
+    
+    valid_count = 0
+    removed_count = 0
+    total_files = len(jpeg_files)
+    
+    print(f"FFmpeg validating {total_files} JPEG files...")
+    
+    for i, jpeg_file in enumerate(jpeg_files):
+        # Progress indicator for large file counts
+        if i % 50 == 0:
+            print(f"FFmpeg validation progress: {i}/{total_files} files processed...")
+            
+        try:
+            # Use ffmpeg to test decode the JPEG file
+            cmd = [
+                'ffmpeg',
+                '-v', 'error',  # Only show errors
+                '-i', jpeg_file,
+                '-f', 'null',
+                '-'
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)  # 5 second timeout per file
+            
+            if result.returncode == 0:
+                valid_count += 1
+            else:
+                print(f"Removing JPEG file that ffmpeg cannot decode: {os.path.basename(jpeg_file)}")
+                if result.stderr.strip():
+                    print(f"FFmpeg error: {result.stderr.strip()[:100]}...")  # Truncate long error messages
+                os.remove(jpeg_file)
+                removed_count += 1
+                
+        except subprocess.TimeoutExpired:
+            print(f"Removing JPEG file that timed out during validation: {os.path.basename(jpeg_file)}")
+            try:
+                os.remove(jpeg_file)
+                removed_count += 1
+            except OSError:
+                pass
+        except Exception as e:
+            print(f"Error validating {os.path.basename(jpeg_file)} with ffmpeg: {e}")
+            try:
+                os.remove(jpeg_file)
+                removed_count += 1
+            except OSError:
+                pass
+    
+    print(f"FFmpeg validation complete: {valid_count} valid, {removed_count} removed")
+    return valid_count, removed_count
+
 def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30):
     """
-    Combine JPEG files into MP4 video using ffmpeg
+    Combine JPEG files into MP4 video using ffmpeg - optimized for VLC-compatible JPEGs
     
     Args:
         input_dir: Directory containing JPEG files
@@ -95,7 +241,6 @@ def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30
         print("Error: ffmpeg is not installed or not found in PATH")
         return False
     
-    # Find all JPEG files in the directory
     jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
     jpeg_files = sorted(glob.glob(jpeg_pattern))
     
@@ -104,28 +249,329 @@ def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30
         return False
     
     print(f"Found {len(jpeg_files)} JPEG files to combine")
-    
-    # Create input pattern for ffmpeg
     input_pattern = os.path.join(input_dir, "video%04d.jpeg")
     
-    # FFmpeg command to combine JPEG sequence into MP4
-    ffmpeg_cmd = [
+    # Strategy 1: Use image2 demuxer with more lenient settings
+    print("Trying image2 demuxer approach...")
+    ffmpeg_cmd_image2 = [
         'ffmpeg',
-        '-y',  # Overwrite output file if it exists
+        '-y',
+        '-f', 'image2',
         '-framerate', str(framerate),
         '-i', input_pattern,
         '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '23',
         '-pix_fmt', 'yuv420p',
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',  # Ensure even dimensions
+        '-movflags', '+faststart',
         output_file
     ]
     
     try:
-        print(f"Combining JPEG files into {output_file}...")
-        subprocess.run(ffmpeg_cmd, check=True)
-        print(f"Successfully created {output_file}")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error running ffmpeg: {e}")
+        result = subprocess.run(ffmpeg_cmd_image2, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using image2 demuxer")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Image2 approach failed: {result.stderr[:300]}...")
+            
+    except subprocess.TimeoutExpired:
+        print("Image2 approach timed out")
+    except Exception as e:
+        print(f"Image2 approach error: {e}")
+    
+    # Strategy 2: Use concat demuxer (create file list)
+    print("Trying concat demuxer approach...")
+    try:
+        concat_file = os.path.join(input_dir, "file_list.txt")
+        with open(concat_file, 'w') as f:
+            for jpeg_file in jpeg_files:
+                rel_path = os.path.relpath(jpeg_file, input_dir)
+                f.write(f"file '{rel_path}'\n")
+                f.write(f"duration {1.0/framerate}\n")
+        
+        ffmpeg_cmd_concat = [
+            'ffmpeg',
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-movflags', '+faststart',
+            output_file
+        ]
+        
+        result = subprocess.run(ffmpeg_cmd_concat, capture_output=True, text=True, timeout=300)
+        
+        # Clean up
+        try:
+            os.remove(concat_file)
+        except:
+            pass
+        
+        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using concat demuxer")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Concat approach failed: {result.stderr[:300]}...")
+            
+    except subprocess.TimeoutExpired:
+        print("Concat approach timed out")
+    except Exception as e:
+        print(f"Concat approach error: {e}")
+    
+    # Strategy 3: Copy individual files to temporary location and use glob pattern
+    print("Trying copy-and-process approach...")
+    try:
+        temp_dir = os.path.join(input_dir, "temp_processing")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        print("Copying files to temporary location...")
+        copied_files = []
+        for i, jpeg_file in enumerate(jpeg_files[:100]):  # Process first 100 files as test
+            if i % 50 == 0:
+                print(f"Copying file {i}/{min(100, len(jpeg_files))}...")
+            temp_name = os.path.join(temp_dir, f"frame{i:06d}.jpg")
+            shutil.copy2(jpeg_file, temp_name)
+            copied_files.append(temp_name)
+        
+        temp_pattern = os.path.join(temp_dir, "frame%06d.jpg")
+        
+        ffmpeg_cmd_temp = [
+            'ffmpeg',
+            '-y',
+            '-f', 'image2',
+            '-framerate', str(framerate),
+            '-i', temp_pattern,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '25',
+            '-pix_fmt', 'yuv420p',
+            '-t', '10',  # Create 10 second test video
+            os.path.join(input_dir, "test_output.mp4")
+        ]
+        
+        result = subprocess.run(ffmpeg_cmd_temp, capture_output=True, text=True, timeout=60)
+        
+        # Clean up temp files
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+        
+        test_output = os.path.join(input_dir, "test_output.mp4")
+        if result.returncode == 0 and os.path.exists(test_output) and os.path.getsize(test_output) > 1024:
+            print("Test successful! Processing all files...")
+            
+            # Now process all files
+            os.makedirs(temp_dir, exist_ok=True)
+            for i, jpeg_file in enumerate(jpeg_files):
+                if i % 200 == 0:
+                    print(f"Processing file {i}/{len(jpeg_files)}...")
+                temp_name = os.path.join(temp_dir, f"frame{i:06d}.jpg")
+                shutil.copy2(jpeg_file, temp_name)
+            
+            temp_pattern = os.path.join(temp_dir, "frame%06d.jpg")
+            
+            ffmpeg_cmd_full = [
+                'ffmpeg',
+                '-y',
+                '-f', 'image2',
+                '-framerate', str(framerate),
+                '-i', temp_pattern,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                output_file
+            ]
+            
+            print("Creating full video...")
+            result = subprocess.run(ffmpeg_cmd_full, capture_output=True, text=True)
+            
+            # Clean up
+            try:
+                shutil.rmtree(temp_dir)
+                os.remove(test_output)
+            except:
+                pass
+            
+            if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                print(f"Successfully created {output_file} using copy approach")
+                print(f"Output video size: {size_mb:.1f} MB")
+                return True
+        else:
+            print(f"Copy approach test failed: {result.stderr[:300]}...")
+            
+    except Exception as e:
+        print(f"Copy approach error: {e}")
+    
+    # Strategy 4: Force with maximum error tolerance
+    print("Trying maximum error tolerance approach...")
+    ffmpeg_cmd_force = [
+        'ffmpeg',
+        '-y',
+        '-analyzeduration', '2147483647',
+        '-probesize', '2147483647',
+        '-f', 'image2',
+        '-framerate', str(framerate),
+        '-i', input_pattern,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-avoid_negative_ts', 'make_zero',
+        '-fflags', '+discardcorrupt+genpts+igndts',
+        '-err_detect', 'ignore_err',
+        '-ignore_unknown',
+        '-max_muxing_queue_size', '4096',
+        output_file
+    ]
+    
+    try:
+        result = subprocess.run(ffmpeg_cmd_force, capture_output=True, text=True)
+        
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Force approach created output: {size_mb:.1f} MB")
+            if result.returncode != 0:
+                print("Warning: Video created with errors, but should be playable")
+            return True
+        else:
+            print("Force approach failed to create usable output")
+            
+    except Exception as e:
+        print(f"Force approach error: {e}")
+    
+    print("All approaches failed. The JPEG files may use a format that's incompatible with ffmpeg's MJPEG decoder.")
+    print("You might need to convert the files to a different format first or use a different tool.")
+    return False
+
+def try_alternative_ffmpeg_approach(input_dir, output_file, framerate):
+    """
+    Alternative approach using concat demuxer to handle corrupted files better
+    """
+    try:
+        # Get list of valid JPEG files
+        jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
+        jpeg_files = sorted(glob.glob(jpeg_pattern))
+        
+        if not jpeg_files:
+            return False
+        
+        # Create a temporary file list for ffmpeg concat
+        concat_file = os.path.join(input_dir, "file_list.txt")
+        with open(concat_file, 'w') as f:
+            for jpeg_file in jpeg_files:
+                # Use relative path from input_dir
+                rel_path = os.path.relpath(jpeg_file, input_dir)
+                f.write(f"file '{rel_path}'\n")
+                f.write(f"duration {1.0/framerate}\n")  # Set frame duration
+        
+        # FFmpeg command using concat demuxer
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-r', str(framerate),  # Set output framerate
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',  # Ensure even dimensions
+            output_file
+        ]
+        
+        print("Trying concat approach...")
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        
+        # Clean up temporary file
+        try:
+            os.remove(concat_file)
+        except OSError:
+            pass
+        
+        if result.returncode == 0:
+            print(f"Successfully created {output_file} using alternative approach")
+            return True
+        else:
+            print(f"Alternative approach also failed: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        print(f"Alternative approach error: {e}")
+        return False
+
+def force_combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30):
+    """
+    Force combine JPEG files without validation - fastest approach
+    """
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: ffmpeg is not installed or not found in PATH")
+        return False
+    
+    jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
+    jpeg_files = sorted(glob.glob(jpeg_pattern))
+    
+    if not jpeg_files:
+        print(f"No JPEG files found in {input_dir}")
+        return False
+    
+    print(f"Force combining {len(jpeg_files)} JPEG files without validation...")
+    
+    input_pattern = os.path.join(input_dir, "video%04d.jpeg")
+    
+    # Ultra-permissive ffmpeg command
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-y',
+        '-framerate', str(framerate),
+        '-pattern_type', 'sequence',
+        '-i', input_pattern,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-f', 'mp4',
+        '-ignore_unknown',
+        '-err_detect', 'ignore_err',
+        '-fflags', '+discardcorrupt+genpts+igndts',
+        '-avoid_negative_ts', 'make_zero',
+        '-vsync', 'vfr',
+        '-max_muxing_queue_size', '2048',
+        output_file
+    ]
+    
+    try:
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        
+        # Accept any output, even with errors
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Force combine created output: {size_mb:.1f} MB")
+            if result.returncode != 0:
+                print("Warning: Video created with errors, check quality manually")
+            return True
+        else:
+            print("Force combine failed to create usable output")
+            return False
+            
+    except Exception as e:
+        print(f"Force combine error: {e}")
         return False
 
 def main():
@@ -134,6 +580,7 @@ def main():
     parser.add_argument('base_url', help='Base URL where video segments are located (use empty string "" if M3U8 contains full URLs)')
     parser.add_argument('--output-dir', '-o', default='downloaded_jpeg_videos', help='Output directory for downloaded files (default: downloaded_jpeg_videos)')
     parser.add_argument('--no-combine-video', action='store_true', help='Skip combining JPEG files into MP4 video')
+    parser.add_argument('--force-combine', action='store_true', help='Force video creation without validation (faster but may fail)')
     parser.add_argument('--video-output', '-v', default='output_video.mp4', help='Output MP4 filename (default: output_video.mp4)')
     parser.add_argument('--framerate', '-f', type=int, default=30, help='Video framerate (default: 30)')
     
@@ -155,7 +602,12 @@ def main():
     
     # Combine JPEG files into MP4 if requested (default behavior, unless --no-combine-video is specified)
     if not args.no_combine_video:
-        combine_success = combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
+        if args.force_combine:
+            # Force combine without validation - just try basic ffmpeg
+            combine_success = force_combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
+        else:
+            combine_success = combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
+            
         if not combine_success:
             print("Video combination failed, but downloaded files are available.")
             sys.exit(1)
