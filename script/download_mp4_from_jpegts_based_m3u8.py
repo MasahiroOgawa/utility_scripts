@@ -574,6 +574,176 @@ def force_combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framer
         print(f"Force combine error: {e}")
         return False
 
+def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
+    """
+    Combine MPEGTS video segments into MP4 video using ffmpeg
+    
+    Args:
+        input_dir: Directory containing MPEGTS segment files (with .jpeg extension)
+        output_file: Output MP4 filename
+        
+    Returns:
+        bool: True if combination successful, False otherwise
+    """
+    # Check if ffmpeg is available
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: ffmpeg is not installed or not found in PATH")
+        return False
+    
+    jpeg_pattern = os.path.join(input_dir, "video*.jpeg")
+    segment_files = sorted(glob.glob(jpeg_pattern))
+    
+    if not segment_files:
+        print(f"No video segment files found in {input_dir}")
+        return False
+    
+    print(f"Found {len(segment_files)} MPEGTS segment files to combine")
+    
+    # Strategy 1: Use concat demuxer with MPEGTS segments
+    print("Trying concat demuxer for MPEGTS segments...")
+    try:
+        concat_file = os.path.join(input_dir, "segment_list.txt")
+        with open(concat_file, 'w') as f:
+            for segment_file in segment_files:
+                # Use absolute path to avoid issues
+                abs_path = os.path.abspath(segment_file)
+                f.write(f"file '{abs_path}'\n")
+        
+        ffmpeg_cmd_concat = [
+            'ffmpeg',
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file,
+            '-c', 'copy',  # Copy streams without re-encoding for speed
+            '-bsf:a', 'aac_adtstoasc',  # Fix AAC stream if needed
+            output_file
+        ]
+        
+        print("Running ffmpeg concatenation (this may take a while for large files)...")
+        result = subprocess.run(ffmpeg_cmd_concat, capture_output=True, text=True, timeout=1800)  # 30 minute timeout
+        
+        # Clean up
+        try:
+            os.remove(concat_file)
+        except:
+            pass
+        
+        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using concat demuxer for MPEGTS")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"MPEGTS concat approach failed: {result.stderr[:500]}...")
+            
+    except subprocess.TimeoutExpired:
+        print("MPEGTS concat approach timed out (processing very large file)")
+        return False
+    except Exception as e:
+        print(f"MPEGTS concat approach error: {e}")
+    
+    # Strategy 2: Try with re-encoding if copy failed
+    print("Trying concat demuxer with re-encoding...")
+    try:
+        concat_file = os.path.join(input_dir, "segment_list.txt")
+        with open(concat_file, 'w') as f:
+            for segment_file in segment_files:
+                abs_path = os.path.abspath(segment_file)
+                f.write(f"file '{abs_path}'\n")
+        
+        ffmpeg_cmd_reencode = [
+            'ffmpeg',
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            output_file
+        ]
+        
+        print("Running ffmpeg with re-encoding (this will take longer)...")
+        result = subprocess.run(ffmpeg_cmd_reencode, capture_output=True, text=True, timeout=3600)  # 1 hour timeout
+        
+        # Clean up
+        try:
+            os.remove(concat_file)
+        except:
+            pass
+        
+        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using re-encoding approach")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"MPEGTS re-encoding approach failed: {result.stderr[:500]}...")
+            
+    except subprocess.TimeoutExpired:
+        print("MPEGTS re-encoding approach timed out")
+        return False
+    except Exception as e:
+        print(f"MPEGTS re-encoding approach error: {e}")
+    
+    # Strategy 3: Try binary concatenation for MPEGTS
+    print("Trying binary concatenation for MPEGTS segments...")
+    try:
+        print("Concatenating MPEGTS segments using binary method...")
+        temp_combined = os.path.join(input_dir, "temp_combined.ts")
+        
+        with open(temp_combined, 'wb') as outfile:
+            for i, segment_file in enumerate(segment_files):
+                if i % 100 == 0:
+                    print(f"Processing segment {i+1}/{len(segment_files)}...")
+                with open(segment_file, 'rb') as infile:
+                    outfile.write(infile.read())
+        
+        # Convert the combined TS file to MP4
+        ffmpeg_cmd_convert = [
+            'ffmpeg',
+            '-y',
+            '-i', temp_combined,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            output_file
+        ]
+        
+        print("Converting combined TS file to MP4...")
+        result = subprocess.run(ffmpeg_cmd_convert, capture_output=True, text=True, timeout=3600)
+        
+        # Clean up
+        try:
+            os.remove(temp_combined)
+        except:
+            pass
+        
+        if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using binary concatenation")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Binary concatenation approach failed: {result.stderr[:500]}...")
+            
+    except subprocess.TimeoutExpired:
+        print("Binary concatenation approach timed out")
+        return False
+    except Exception as e:
+        print(f"Binary concatenation approach error: {e}")
+    
+    print("All MPEGTS combination strategies failed.")
+    return False
+
 def main():
     parser = argparse.ArgumentParser(description='Download JPEG video segments from M3U8 file')
     parser.add_argument('m3u8_file_path', help='Path to the M3U8 file')
@@ -600,13 +770,10 @@ def main():
     if not download_success:
         sys.exit(1)
     
-    # Combine JPEG files into MP4 if requested (default behavior, unless --no-combine-video is specified)
+    # Combine video segments into MP4 if requested (default behavior, unless --no-combine-video is specified)
     if not args.no_combine_video:
-        if args.force_combine:
-            # Force combine without validation - just try basic ffmpeg
-            combine_success = force_combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
-        else:
-            combine_success = combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
+        print("Detected MPEGTS format segments, using appropriate combination method...")
+        combine_success = combine_mpegts_segments_to_mp4(output_directory, args.video_output)
             
         if not combine_success:
             print("Video combination failed, but downloaded files are available.")
