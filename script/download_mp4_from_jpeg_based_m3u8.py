@@ -133,7 +133,7 @@ def main():
     parser.add_argument('m3u8_file_path', help='Path to the M3U8 file')
     parser.add_argument('base_url', help='Base URL where video segments are located (use empty string "" if M3U8 contains full URLs)')
     parser.add_argument('--output-dir', '-o', default='downloaded_jpeg_videos', help='Output directory for downloaded files (default: downloaded_jpeg_videos)')
-    parser.add_argument('--combine-video', '-c', action='store_true', help='Combine downloaded JPEG files into MP4 video')
+    parser.add_argument('--no-combine-video', action='store_true', help='Skip combining JPEG files into MP4 video')
     parser.add_argument('--video-output', '-v', default='output_video.mp4', help='Output MP4 filename (default: output_video.mp4)')
     parser.add_argument('--framerate', '-f', type=int, default=30, help='Video framerate (default: 30)')
     
@@ -153,8 +153,8 @@ def main():
     if not download_success:
         sys.exit(1)
     
-    # Combine JPEG files into MP4 if requested
-    if args.combine_video:
+    # Combine JPEG files into MP4 if requested (default behavior, unless --no-combine-video is specified)
+    if not args.no_combine_video:
         combine_success = combine_jpegs_to_mp4(output_directory, args.video_output, args.framerate)
         if not combine_success:
             print("Video combination failed, but downloaded files are available.")
