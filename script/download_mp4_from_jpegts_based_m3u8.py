@@ -8,14 +8,15 @@ import sys
 import requests
 
 
-def download_segments_from_m3u8(m3u8_file_path, base_url, output_directory):
+def download_segments_from_m3u8(m3u8_file_path, output_directory, base_url=None):
     """
     Download video segments from M3U8 file (any URL, not just .ts/.jpeg)
+    Supports optional base_url for relative segment paths.
 
     Args:
         m3u8_file_path: Path to the M3U8 file
-        base_url: Base URL where video segments are located
         output_directory: Directory to save downloaded files
+        base_url: Optional base URL for relative segment paths
 
     Returns:
         bool: True if download completed successfully, False otherwise
@@ -35,11 +36,14 @@ def download_segments_from_m3u8(m3u8_file_path, base_url, output_directory):
         # Ignore comments and empty lines
         if not line or line.startswith("#"):
             continue
-        # Accept any line that looks like a segment URL
+        # Accept any line that looks like a segment URL or path
         if line.startswith("http://") or line.startswith("https://"):
             segment_urls.append(line)
         elif base_url:
-            segment_urls.append(base_url + line)
+            # Join base_url and relative path
+            segment_urls.append(base_url.rstrip("/") + "/" + line.lstrip("/"))
+        else:
+            print(f"Warning: Skipping relative segment path without base_url: {line}")
 
     print(f"Found {len(segment_urls)} segment URLs in M3U8.")
 
@@ -365,8 +369,8 @@ def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30
         # Clean up
         try:
             os.remove(concat_file)
-        except:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not remove concat file: {e}")
 
         if (
             result.returncode == 0
@@ -433,7 +437,7 @@ def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30
         # Clean up temp files
         try:
             shutil.rmtree(temp_dir)
-        except:
+        except Exception:
             pass
 
         test_output = os.path.join(input_dir, "test_output.mp4")
@@ -483,7 +487,7 @@ def combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framerate=30
             try:
                 shutil.rmtree(temp_dir)
                 os.remove(test_output)
-            except:
+            except Exception:
                 pass
 
             if (
@@ -608,7 +612,8 @@ def try_alternative_ffmpeg_approach(input_dir, output_file, framerate):
         # Clean up temporary file
         try:
             os.remove(concat_file)
-        except OSError:
+        except Exception as e:
+            print(f"Warning: Could not remove concat file: {e}")
             pass
 
         if result.returncode == 0:
@@ -780,14 +785,15 @@ def main():
     )
     parser.add_argument("m3u8_file_path", help="Path to the M3U8 file")
     parser.add_argument(
-        "base_url",
-        help='Base URL where video segments are located (use empty string "" if M3U8 contains full URLs)',
-    )
-    parser.add_argument(
         "--output-dir",
         "-o",
         default="downloaded_segments",
         help="Output directory for downloaded files (default: downloaded_segments)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Optional base URL for relative segment paths in M3U8 file",
     )
     parser.add_argument(
         "--no-combine-video",
@@ -802,12 +808,10 @@ def main():
     )
     args = parser.parse_args()
     m3u8_file_path = args.m3u8_file_path
-    base_url = args.base_url
     output_directory = args.output_dir
-    if base_url and not base_url.endswith("/"):
-        base_url += "/"
+    base_url = args.base_url
     download_success = download_segments_from_m3u8(
-        m3u8_file_path, base_url, output_directory
+        m3u8_file_path, output_directory, base_url
     )
     if not download_success:
         sys.exit(1)
