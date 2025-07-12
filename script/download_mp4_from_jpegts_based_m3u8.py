@@ -60,7 +60,15 @@ def download_segments_from_m3u8(m3u8_file_path, output_directory, base_url=None)
 
         try:
             print(f"Downloading {url} to {filename}...")
-            response = requests.get(url, stream=True)
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://www.eporner.com/",  # Set to main site or playlist page
+            }
+            response = requests.get(url, stream=True, headers=headers)
             response.raise_for_status()
 
             with open(filename, "wb") as out_file:
