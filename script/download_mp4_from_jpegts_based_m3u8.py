@@ -712,7 +712,7 @@ def force_combine_jpegs_to_mp4(input_dir, output_file="output_video.mp4", framer
 
 def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
     """
-    Combine MPEGTS video segments into MP4 video using ffmpeg
+    Combine MPEGTS video segments into MP4 video using ffmpeg with multiple strategies
 
     Args:
         input_dir: Directory containing segment files (.ts)
@@ -736,13 +736,33 @@ def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
         return False
 
     print(f"Found {len(ts_files)} segment files to combine")
-    print("Trying concat demuxer for MPEGTS segments...")
+    
+    # Check if files are valid MPEG-TS format
+    print("Checking file format...")
+    try:
+        with open(ts_files[0], "rb") as f:
+            header = f.read(4)
+            # Check for MPEG-TS sync byte (0x47)
+            if header[0] != 0x47 and header[1] != 0x47 and header[2] != 0x47 and header[3] != 0x47:
+                # Check if it might be encrypted
+                print("\n⚠️  WARNING: The .ts files do not appear to be valid MPEG-TS format.")
+                print("Possible reasons:")
+                print("1. The files may be encrypted (HLS encryption)")
+                print("2. The files may be corrupted during download")
+                print("3. The files may be in a different format despite the .ts extension")
+                print("\nAttempting to combine anyway, but this may fail...")
+    except Exception as e:
+        print(f"Warning: Could not check file format: {e}")
+    
+    # Strategy 1: Try concat demuxer with copy codec (fastest)
+    print("Strategy 1: Trying concat demuxer with stream copy...")
     try:
         concat_file = os.path.join(input_dir, "segment_list.txt")
         with open(concat_file, "w") as f:
             for ts_file in ts_files:
                 abs_path = os.path.abspath(ts_file)
                 f.write(f"file '{abs_path}'\n")
+        
         ffmpeg_cmd_concat = [
             "ffmpeg",
             "-y",
@@ -758,32 +778,339 @@ def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
             "aac_adtstoasc",
             output_file,
         ]
+        
         print("Running ffmpeg concatenation (this may take a while for large files)...")
         result = subprocess.run(
             ffmpeg_cmd_concat, capture_output=True, text=True, timeout=1800
         )
+        
         try:
             os.remove(concat_file)
-        except Exception as e:
-            print(f"Warning: Could not remove concat file: {e}")
+        except Exception:
+            pass
+        
         if (
             result.returncode == 0
             and os.path.exists(output_file)
             and os.path.getsize(output_file) > 1024
         ):
             size_mb = os.path.getsize(output_file) / (1024 * 1024)
-            print(f"Successfully created {output_file} using concat demuxer for MPEGTS")
+            print(f"Successfully created {output_file} using concat demuxer")
             print(f"Output video size: {size_mb:.1f} MB")
             return True
         else:
-            print(f"MPEGTS concat approach failed: {result.stderr[:500]}...")
+            print(f"Strategy 1 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
     except subprocess.TimeoutExpired:
-        print("MPEGTS concat approach timed out (processing very large file)")
-        return False
+        print("Strategy 1 timed out")
     except Exception as e:
-        print(f"MPEGTS concat approach error: {e}")
+        print(f"Strategy 1 error: {e}")
 
-    print("All MPEGTS combination strategies failed.")
+    # Strategy 2: Try concat protocol (direct concatenation)
+    print("\nStrategy 2: Trying concat protocol...")
+    try:
+        # Build concat string
+        concat_string = "concat:" + "|".join([os.path.abspath(f) for f in ts_files])
+        
+        ffmpeg_cmd_protocol = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            concat_string,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            output_file,
+        ]
+        
+        result = subprocess.run(
+            ffmpeg_cmd_protocol, capture_output=True, text=True, timeout=1800
+        )
+        
+        if (
+            result.returncode == 0
+            and os.path.exists(output_file)
+            and os.path.getsize(output_file) > 1024
+        ):
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using concat protocol")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Strategy 2 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
+    except subprocess.TimeoutExpired:
+        print("Strategy 2 timed out")
+    except Exception as e:
+        print(f"Strategy 2 error: {e}")
+
+    # Strategy 3: Binary concatenation then remux
+    print("\nStrategy 3: Trying binary concatenation then remux...")
+    try:
+        temp_concat_file = os.path.join(input_dir, "temp_concat.ts")
+        
+        # Concatenate all .ts files into one
+        print("Concatenating TS files...")
+        with open(temp_concat_file, "wb") as outfile:
+            for i, ts_file in enumerate(ts_files):
+                if i % 100 == 0:
+                    print(f"Processing file {i}/{len(ts_files)}...")
+                with open(ts_file, "rb") as infile:
+                    outfile.write(infile.read())
+        
+        print("Remuxing concatenated file to MP4...")
+        ffmpeg_cmd_remux = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            temp_concat_file,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            output_file,
+        ]
+        
+        result = subprocess.run(
+            ffmpeg_cmd_remux, capture_output=True, text=True, timeout=1800
+        )
+        
+        # Clean up temp file
+        try:
+            os.remove(temp_concat_file)
+        except Exception:
+            pass
+        
+        if (
+            result.returncode == 0
+            and os.path.exists(output_file)
+            and os.path.getsize(output_file) > 1024
+        ):
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using binary concatenation")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Strategy 3 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
+    except subprocess.TimeoutExpired:
+        print("Strategy 3 timed out")
+    except Exception as e:
+        print(f"Strategy 3 error: {e}")
+
+    # Strategy 4: Re-encode with error recovery
+    print("\nStrategy 4: Trying re-encoding with error recovery...")
+    try:
+        concat_file = os.path.join(input_dir, "segment_list.txt")
+        with open(concat_file, "w") as f:
+            for ts_file in ts_files:
+                abs_path = os.path.abspath(ts_file)
+                f.write(f"file '{abs_path}'\n")
+        
+        ffmpeg_cmd_reencode = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_file,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-max_muxing_queue_size",
+            "9999",
+            "-err_detect",
+            "ignore_err",
+            "-fflags",
+            "+genpts+igndts",
+            output_file,
+        ]
+        
+        print("Running ffmpeg re-encoding (this will take longer)...")
+        result = subprocess.run(
+            ffmpeg_cmd_reencode, capture_output=True, text=True, timeout=3600
+        )
+        
+        try:
+            os.remove(concat_file)
+        except Exception:
+            pass
+        
+        if (
+            result.returncode == 0
+            and os.path.exists(output_file)
+            and os.path.getsize(output_file) > 1024
+        ):
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Successfully created {output_file} using re-encoding")
+            print(f"Output video size: {size_mb:.1f} MB")
+            return True
+        else:
+            print(f"Strategy 4 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
+    except subprocess.TimeoutExpired:
+        print("Strategy 4 timed out")
+    except Exception as e:
+        print(f"Strategy 4 error: {e}")
+
+    # Strategy 5: Force with maximum error tolerance
+    print("\nStrategy 5: Trying maximum error tolerance approach...")
+    try:
+        # First, try to analyze one segment to get stream info
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_streams",
+            "-print_format",
+            "json",
+            ts_files[0]
+        ]
+        
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        
+        concat_file = os.path.join(input_dir, "segment_list.txt")
+        with open(concat_file, "w") as f:
+            for ts_file in ts_files:
+                abs_path = os.path.abspath(ts_file)
+                f.write(f"file '{abs_path}'\n")
+        
+        ffmpeg_cmd_force = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_file,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-fflags",
+            "+discardcorrupt+genpts+igndts",
+            "-err_detect",
+            "ignore_err",
+            "-ignore_unknown",
+            "-max_muxing_queue_size",
+            "9999",
+            "-f",
+            "mp4",
+            output_file,
+        ]
+        
+        result = subprocess.run(
+            ffmpeg_cmd_force, capture_output=True, text=True, timeout=1800
+        )
+        
+        try:
+            os.remove(concat_file)
+        except Exception:
+            pass
+        
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            print(f"Created {output_file} with error recovery")
+            print(f"Output video size: {size_mb:.1f} MB")
+            if result.returncode != 0:
+                print("Warning: Video created with errors, but should be playable")
+            return True
+    except Exception as e:
+        print(f"Strategy 5 error: {e}")
+
+    # Strategy 6: Try treating files as raw H264/H265 streams
+    print("\nStrategy 6: Trying to treat as raw video streams...")
+    try:
+        # Try to concatenate and convert as raw stream
+        temp_concat_file = os.path.join(input_dir, "temp_raw.h264")
+        
+        print("Concatenating as raw stream...")
+        with open(temp_concat_file, "wb") as outfile:
+            for i, ts_file in enumerate(ts_files[:100]):  # Test with first 100 files
+                if i % 20 == 0:
+                    print(f"Processing file {i}/100...")
+                with open(ts_file, "rb") as infile:
+                    outfile.write(infile.read())
+        
+        # Try to convert raw stream to MP4
+        ffmpeg_cmd_raw = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "h264",
+            "-i",
+            temp_concat_file,
+            "-c:v",
+            "copy",
+            "-f",
+            "mp4",
+            os.path.join(input_dir, "test_raw.mp4"),
+        ]
+        
+        result = subprocess.run(
+            ffmpeg_cmd_raw, capture_output=True, text=True, timeout=60
+        )
+        
+        try:
+            os.remove(temp_concat_file)
+        except Exception:
+            pass
+        
+        if result.returncode != 0:
+            # Try as HEVC/H265
+            print("H264 failed, trying as H265/HEVC...")
+            temp_concat_file = os.path.join(input_dir, "temp_raw.h265")
+            with open(temp_concat_file, "wb") as outfile:
+                for i, ts_file in enumerate(ts_files[:100]):
+                    with open(ts_file, "rb") as infile:
+                        outfile.write(infile.read())
+            
+            ffmpeg_cmd_raw = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "hevc",
+                "-i",
+                temp_concat_file,
+                "-c:v",
+                "copy",
+                "-f",
+                "mp4",
+                os.path.join(input_dir, "test_raw.mp4"),
+            ]
+            
+            result = subprocess.run(
+                ffmpeg_cmd_raw, capture_output=True, text=True, timeout=60
+            )
+            
+            try:
+                os.remove(temp_concat_file)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Strategy 6 error: {e}")
+
+    print("\nAll MPEGTS combination strategies failed.")
+    print("\n⚠️  IMPORTANT: The files appear to be encrypted or in an unsupported format.")
+    print("\nPossible solutions:")
+    print("1. Check if the M3U8 file contains #EXT-X-KEY tag (encryption info)")
+    print("2. Use a tool that supports HLS decryption (e.g., youtube-dl, yt-dlp)")
+    print("3. The segments might need special headers or decryption keys")
+    print("4. Try using a different downloader that handles encryption")
+    print("\nThe downloaded segment files are available in:", input_dir)
     return False
 
 
