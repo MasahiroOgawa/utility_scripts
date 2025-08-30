@@ -1116,9 +1116,13 @@ def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download video segments from M3U8 file and combine to MP4"
+        description="Download video segments from M3U8 file and combine to MP4, or combine existing TS files"
     )
-    parser.add_argument("m3u8_file_path", help="Path to the M3U8 file")
+    parser.add_argument(
+        "m3u8_file_path", 
+        nargs="?",
+        help="Path to the M3U8 file (optional if using --from-ts-dir)"
+    )
     parser.add_argument(
         "--output-dir",
         "-o",
@@ -1141,7 +1145,42 @@ def main():
         default="output_video.mp4",
         help="Output MP4 filename (default: output_video.mp4)",
     )
+    parser.add_argument(
+        "--from-ts-dir",
+        default=None,
+        help="Directory containing existing .ts files to combine (skips download)",
+    )
     args = parser.parse_args()
+    
+    # Mode 1: Combine existing TS files without downloading
+    if args.from_ts_dir:
+        if not os.path.exists(args.from_ts_dir):
+            print(f"Error: Directory '{args.from_ts_dir}' not found.")
+            sys.exit(1)
+        
+        ts_files = glob.glob(os.path.join(args.from_ts_dir, "*.ts"))
+        if not ts_files:
+            print(f"No .ts files found in directory '{args.from_ts_dir}'")
+            sys.exit(1)
+        
+        print(f"Found {len(ts_files)} .ts files in '{args.from_ts_dir}'")
+        print("Combining TS files into MP4...")
+        combine_success = combine_mpegts_segments_to_mp4(
+            args.from_ts_dir, args.video_output
+        )
+        if not combine_success:
+            print("Video combination failed.")
+            sys.exit(1)
+        else:
+            print(f"Successfully created: {args.video_output}")
+            sys.exit(0)
+    
+    # Mode 2: Download from M3U8 and combine
+    if not args.m3u8_file_path:
+        print("Error: Either provide an M3U8 file or use --from-ts-dir option")
+        parser.print_help()
+        sys.exit(1)
+    
     m3u8_file_path = args.m3u8_file_path
     output_directory = args.output_dir
     base_url = args.base_url
