@@ -6,6 +6,9 @@ import subprocess
 import sys
 
 import requests
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import binascii
 
 
 def download_segments_from_m3u8(m3u8_file_path, output_directory, base_url=None):
@@ -30,58 +33,149 @@ def download_segments_from_m3u8(m3u8_file_path, output_directory, base_url=None)
     with open(m3u8_file_path, "r") as f:
         lines = f.readlines()
 
-    segment_urls = []
+    segments = []
+    current_key = None
+    
     for line in lines:
         line = line.strip()
-        # Ignore comments and empty lines
-        if not line or line.startswith("#"):
+        if not line:
             continue
-        # Accept any line that looks like a segment URL or path
+            
+        if line.startswith("#EXT-X-KEY"):
+            # Parse encryption key
+            # Format: #EXT-X-KEY:METHOD=AES-128,URI="...",IV=...
+            parts = line[12:].split(",")
+            key_info = {"method": "NONE", "uri": None, "iv": None}
+            
+            for part in parts:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    if key == "METHOD":
+                        key_info["method"] = value
+                    elif key == "URI":
+                        key_info["uri"] = value.strip('"')
+                    elif key == "IV":
+                        key_info["iv"] = value
+            
+            if key_info["method"] == "AES-128":
+                current_key = key_info
+            else:
+                current_key = None
+                if key_info["method"] != "NONE":
+                    print(f"Warning: Unsupported encryption method: {key_info['method']}")
+            continue
+            
+        if line.startswith("#"):
+            continue
+            
+        # Segment URL
+        segment_url = None
         if line.startswith("http://") or line.startswith("https://"):
-            segment_urls.append(line)
+            segment_url = line
         elif base_url:
-            # Join base_url and relative path
-            segment_urls.append(base_url.rstrip("/") + "/" + line.lstrip("/"))
+            segment_url = base_url.rstrip("/") + "/" + line.lstrip("/")
         else:
             print(f"Warning: Skipping relative segment path without base_url: {line}")
+            continue
+            
+        segments.append({
+            "url": segment_url,
+            "key": current_key
+        })
 
-    print(f"Found {len(segment_urls)} segment URLs in M3U8.")
+    print(f"Found {len(segments)} segments in M3U8.")
+    
+    # Cache for downloaded encryption keys
+    key_cache = {}
 
     download_errors = 0
     skipped_files = 0
-    for i, url in enumerate(segment_urls):
+    
+    
+    for i, segment in enumerate(segments):
+        url = segment["url"]
+        key_info = segment["key"]
         filename = os.path.join(output_directory, f"segment{i:04d}.ts")
 
-        # Skip download if file already exists
+        # Check existing file
+        should_download = True
         if os.path.exists(filename):
-            print(f"File {filename} already exists, skipping download...")
-            skipped_files += 1
+            if os.path.getsize(filename) > 0:
+                # Check for sync byte 0x47
+                try:
+                    with open(filename, "rb") as f:
+                        header = f.read(1)
+                        if header == b'\x47':
+                            # Looks valid
+                            skipped_files += 1
+                            should_download = False
+                        else:
+                            print(f"File {filename} exists but seems invalid/encrypted (no 0x47 sync byte). Re-downloading...")
+                except Exception:
+                     print(f"Error checking {filename}. Re-downloading...")
+            else:
+                 print(f"File {filename} is empty. Re-downloading...")
+        
+        if not should_download:
             continue
 
         try:
-            print(f"Downloading {url} to {filename}...")
+            print(f"Downloading segment {i}/{len(segments)}: {url}...")
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
-                "Referer": "https://www.eporner.com/",  # Set to main site or playlist page
+                "Referer": "https://www.google.com/", 
             }
-            response = requests.get(url, stream=True, headers=headers)
+            
+            # Download file content
+            response = requests.get(url, headers=headers)
             response.raise_for_status()
-
+            content = response.content
+            
+            # Decrypt if needed
+            if key_info:
+                key_uri = key_info["uri"]
+                
+                # Resolve Key URI if relative
+                if not key_uri.startswith("http"):
+                    if base_url:
+                         key_uri = base_url.rstrip("/") + "/" + key_uri.lstrip("/")
+                
+                # Download key if not cached
+                if key_uri not in key_cache:
+                    print(f"Downloading key: {key_uri}")
+                    key_response = requests.get(key_uri, headers=headers)
+                    key_response.raise_for_status()
+                    key_cache[key_uri] = key_response.content
+                
+                key_bytes = key_cache[key_uri]
+                
+                # Determine IV
+                if key_info.get("iv"):
+                    iv_bytes = binascii.unhexlify(key_info["iv"].replace("0x", ""))
+                else:
+                    # Use sequence number as IV (big-endian 128-bit)
+                    iv_bytes = i.to_bytes(16, byteorder='big')
+                
+                # Decrypt
+                cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv_bytes), backend=default_backend())
+                decryptor = cipher.decryptor()
+                content = decryptor.update(content) + decryptor.finalize()
+            
+            # Write to file
             with open(filename, "wb") as out_file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    out_file.write(chunk)
-            print(f"Downloaded {filename}")
+                out_file.write(content)
+                
+            print(f"Saved {filename}")
+            
         except requests.exceptions.RequestException as e:
             print(f"Error downloading {url}: {e}")
-            print("Skipping to next file.")
             download_errors += 1
         except Exception as e:
             print(f"An unexpected error occurred for {url}: {e}")
-            print("Skipping to next file.")
             download_errors += 1
 
     if download_errors > 0:
@@ -806,42 +900,46 @@ def combine_mpegts_segments_to_mp4(input_dir, output_file="output_video.mp4"):
         print(f"Strategy 1 error: {e}")
 
     # Strategy 2: Try concat protocol (direct concatenation)
-    print("\nStrategy 2: Trying concat protocol...")
-    try:
-        # Build concat string
-        concat_string = "concat:" + "|".join([os.path.abspath(f) for f in ts_files])
-        
-        ffmpeg_cmd_protocol = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            concat_string,
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            output_file,
-        ]
-        
-        result = subprocess.run(
-            ffmpeg_cmd_protocol, capture_output=True, text=True, timeout=1800
-        )
-        
-        if (
-            result.returncode == 0
-            and os.path.exists(output_file)
-            and os.path.getsize(output_file) > 1024
-        ):
-            size_mb = os.path.getsize(output_file) / (1024 * 1024)
-            print(f"Successfully created {output_file} using concat protocol")
-            print(f"Output video size: {size_mb:.1f} MB")
-            return True
-        else:
-            print(f"Strategy 2 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
-    except subprocess.TimeoutExpired:
-        print("Strategy 2 timed out")
-    except Exception as e:
-        print(f"Strategy 2 error: {e}")
+    # Note: ARG_MAX limitation prevents this for large numbers of files
+    if len(ts_files) > 100:
+        print("\nStrategy 2 skipped: Too many files for command line arguments.")
+    else:
+        print("\nStrategy 2: Trying concat protocol...")
+        try:
+            # Build concat string
+            concat_string = "concat:" + "|".join([os.path.abspath(f) for f in ts_files])
+            
+            ffmpeg_cmd_protocol = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                concat_string,
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                output_file,
+            ]
+            
+            result = subprocess.run(
+                ffmpeg_cmd_protocol, capture_output=True, text=True, timeout=1800
+            )
+            
+            if (
+                result.returncode == 0
+                and os.path.exists(output_file)
+                and os.path.getsize(output_file) > 1024
+            ):
+                size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                print(f"Successfully created {output_file} using concat protocol")
+                print(f"Output video size: {size_mb:.1f} MB")
+                return True
+            else:
+                print(f"Strategy 2 failed: {result.stderr[:300] if result.stderr else 'Unknown error'}...")
+        except subprocess.TimeoutExpired:
+            print("Strategy 2 timed out")
+        except Exception as e:
+            print(f"Strategy 2 error: {e}")
 
     # Strategy 3: Binary concatenation then remux
     print("\nStrategy 3: Trying binary concatenation then remux...")
