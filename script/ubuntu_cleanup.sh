@@ -6,22 +6,25 @@
 set -uo pipefail
 
 CMDNAME=$(basename "$0")
-USAGE="Usage: $CMDNAME [-n dry-run] [-a all] [-v verbose]
+USAGE="Usage: $CMDNAME [-n dry-run] [-a all] [-v verbose] [-c days]
 Options:
     -n  Dry run (show what would be deleted without deleting)
     -a  Clean all (includes system cache, requires sudo)
     -v  Verbose output
+    -c  Days threshold for unused conda environments (default: 180)
     -h  Show this help"
 
 DRY_RUN=false
 CLEAN_ALL=false
 VERBOSE=false
+CONDA_UNUSED_DAYS=180
 
-while getopts navh OPT; do
+while getopts navc:h OPT; do
     case $OPT in
         n) DRY_RUN=true ;;
         a) CLEAN_ALL=true ;;
         v) VERBOSE=true ;;
+        c) CONDA_UNUSED_DAYS=$OPTARG ;;
         h) echo "$USAGE"; exit 0 ;;
         \?) echo "$USAGE" 1>&2; exit 1 ;;
     esac
@@ -186,6 +189,73 @@ done
 # 10. VSCode extension backups
 clean_path "$HOME/.vscode/extensions/extensions_bk" "VSCode extensions backup"
 clean_path "$HOME/.vscode-server/extensions/extensions_bk" "VSCode server extensions backup"
+
+# 11. Old conda environments (not used for CONDA_UNUSED_DAYS)
+log "Cleaning unused conda environments (not accessed in $CONDA_UNUSED_DAYS days)..."
+
+CONDA_ENV_DIRS=(
+    "$HOME/miniconda3/envs"
+    "$HOME/anaconda3/envs"
+    "$HOME/.conda/envs"
+    "$HOME/miniforge3/envs"
+    "$HOME/mambaforge/envs"
+)
+
+get_env_last_access() {
+    local env_path="$1"
+    # Check the most recent access time of key files in the environment
+    local conda_meta="$env_path/conda-meta"
+    if [ -d "$conda_meta" ]; then
+        # Get the most recently accessed file in conda-meta
+        find "$conda_meta" -type f -printf '%A@\n' 2>/dev/null | sort -rn | head -1
+    else
+        # Fallback to directory access time
+        stat -c '%X' "$env_path" 2>/dev/null
+    fi
+}
+
+days_since_access() {
+    local last_access="$1"
+    local now
+    now=$(date +%s)
+    if [ -n "$last_access" ]; then
+        local last_access_int=${last_access%.*}
+        echo $(( (now - last_access_int) / 86400 ))
+    else
+        echo "0"
+    fi
+}
+
+for conda_dir in "${CONDA_ENV_DIRS[@]}"; do
+    if [ -d "$conda_dir" ]; then
+        log_verbose "Checking conda environments in: $conda_dir"
+        for env in "$conda_dir"/*/; do
+            [ -d "$env" ] || continue
+            env_name=$(basename "$env")
+
+            # Skip base environment indicators
+            if [ "$env_name" = "base" ]; then
+                log_verbose "Skipping base environment"
+                continue
+            fi
+
+            last_access=$(get_env_last_access "$env")
+            days=$(days_since_access "$last_access")
+
+            if [ "$days" -ge "$CONDA_UNUSED_DAYS" ]; then
+                size=$(get_size "$env")
+                if $DRY_RUN; then
+                    log "[DRY-RUN] Would remove conda env '$env_name' (unused for $days days): $env ($size)"
+                else
+                    log "Removing conda env '$env_name' (unused for $days days): $env ($size)"
+                    rm -rf "$env" 2>/dev/null || log "Warning: Could not remove $env"
+                fi
+            else
+                log_verbose "Keeping conda env '$env_name' (last used $days days ago)"
+            fi
+        done
+    fi
+done
 
 echo ""
 
