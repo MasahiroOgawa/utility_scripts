@@ -2,7 +2,6 @@
 
 USAGE="Usage: $CMDNAME [-q quality(0-100)] input_heic_existing_dir"
 
-
 while getopts q: OPT
 do
     case $OPT in
@@ -16,28 +15,27 @@ done
 
 # Shift the option arguments to access the non-option arguments
 shift "$((OPTIND-1))"
-arg=$@
+arg="$*"
 
-if [ -z ${arg} ]; then
+if [ -z "${arg}" ]; then
     echo "$USAGE" 1>&2
     exit 1
 else
     INDIR="${arg}"
 fi
 
-
-
-for file in ${INDIR}/*.HEIC
+for file in "${INDIR}"/*.HEIC "${INDIR}"/*.heic
 do
+    [ -e "$file" ] || continue
     echo "converting ${file} ..."
-    
-    # convert ${file} ${file/%.HEIC/.png}
-    
-    if [ -z "${QUALITY}" ]
-    then 
-	heif-convert ${file} ${file/%.HEIC/.png}
+
+    outfile="${file/%.HEIC/.png}"
+    outfile="${outfile/%.heic/.png}"
+
+    if [ -z "${QUALITY}" ]; then
+	heif-convert "$file" "$outfile"
     else
 	echo "quality=${QUALITY}"
-	heif-convert -q ${QUALITY} ${file} ${file/%.HEIC/.png}
-    fi	
+	heif-convert -q "${QUALITY}" "$file" "$outfile"
+    fi
 done
