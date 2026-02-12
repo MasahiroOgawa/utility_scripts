@@ -135,9 +135,66 @@ if [ -d "$HOME/.mozilla/firefox" ]; then
     done
 fi
 
-# Chrome/Chromium
-clean_dir_contents "$HOME/.config/google-chrome/Default/Cache" "Chrome cache"
-clean_dir_contents "$HOME/.config/chromium/Default/Cache" "Chromium cache"
+# Chrome/Chromium - clean all cache directories across all profiles
+CHROME_DIRS=(
+    "$HOME/.config/google-chrome"
+    "$HOME/.config/chromium"
+)
+
+CHROME_CACHE_PATTERNS=(
+    "Cache"
+    "Code Cache"
+    "GPUCache"
+    "GrShaderCache"
+    "ShaderCache"
+    "DawnGraphiteCache"
+    "DawnWebGPUCache"
+    "Service Worker/CacheStorage"
+    "Service Worker/ScriptCache"
+    "Application Cache"
+    "Shared Dictionary/cache"
+    "optimization_guide_hint_cache_store"
+    "AutofillAiModelCache"
+)
+
+for chrome_dir in "${CHROME_DIRS[@]}"; do
+    if [ -d "$chrome_dir" ]; then
+        browser_name=$(basename "$chrome_dir")
+        log_verbose "Cleaning $browser_name caches..."
+
+        # Clean top-level cache directories
+        for pattern in "GrShaderCache" "ShaderCache" "component_crx_cache"; do
+            clean_dir_contents "$chrome_dir/$pattern" "$browser_name $pattern"
+        done
+
+        # Clean cache in each profile (Default, Profile 1, Profile 2, etc.)
+        for profile_dir in "$chrome_dir"/Default "$chrome_dir"/Profile\ *; do
+            [ -d "$profile_dir" ] || continue
+            profile_name=$(basename "$profile_dir")
+
+            for cache_pattern in "${CHROME_CACHE_PATTERNS[@]}"; do
+                cache_path="$profile_dir/$cache_pattern"
+                if [ -d "$cache_path" ]; then
+                    clean_dir_contents "$cache_path" "$browser_name $profile_name $cache_pattern"
+                fi
+            done
+
+            # Clean WebStorage caches (nested structure)
+            if [ -d "$profile_dir/WebStorage" ]; then
+                find "$profile_dir/WebStorage" -type d -name "CacheStorage" 2>/dev/null | while read -r ws_cache; do
+                    clean_dir_contents "$ws_cache" "$browser_name $profile_name WebStorage cache"
+                done
+            fi
+
+            # Clean extension caches
+            if [ -d "$profile_dir/Storage/ext" ]; then
+                find "$profile_dir/Storage/ext" -type d \( -name "*Cache*" -o -name "cache" \) 2>/dev/null | while read -r ext_cache; do
+                    clean_dir_contents "$ext_cache" "$browser_name $profile_name extension cache"
+                done
+            fi
+        done
+    fi
+done
 
 # 5. Old config and cache files
 log "Cleaning old temporary files..."
