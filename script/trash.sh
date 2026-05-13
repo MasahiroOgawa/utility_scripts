@@ -9,18 +9,13 @@ mkdir -p "$TRASH_DIR"
 
 # Move each argument into the trash, picking a unique destination name on
 # collision so the move always succeeds (and never overwrites earlier trash).
-# Use $PWD (bash's logical cwd) rather than realpath: realpath — even with
-# -s — calls getcwd() which always returns the physical path, so a parent
-# directory symlinked through ~/trash would make every file look "already
-# in trash" and get skipped.
+trash_real=$(realpath -- "$TRASH_DIR")
 for arg in "$@"; do
-    case "$arg" in
-        /*) abs="$arg" ;;
-        .|./) abs="$PWD" ;;
-        ..|../) abs="${PWD%/*}" ;;
-        *) abs="$PWD/${arg%/}" ;;
-    esac
-    if [[ "$abs" == "$TRASH_DIR" || "$abs" == "$TRASH_DIR"/* ]]; then
+    abs=$(realpath -- "$arg") || exit 1
+    # Only skip when the file's *immediate parent* is the trash root — a file
+    # in a subdirectory of trash (e.g. ~/trash/Downloads/foo) is exactly what
+    # "clean up" should flatten into ~/trash/foo.
+    if [[ "$(dirname "$abs")" == "$trash_real" ]]; then
         echo "trash.sh: skipping '$arg' (already in $TRASH_DIR)" >&2
         continue
     fi
