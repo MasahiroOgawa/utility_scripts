@@ -10,7 +10,10 @@ mkdir -p "$TRASH_DIR"
 # Move each argument into the trash, picking a unique destination name on
 # collision so the move always succeeds (and never overwrites earlier trash).
 for arg in "$@"; do
-    abs=$(realpath -- "$arg") || exit 1
+    # -s: don't resolve symlinks; only normalize '.' / '..' / trailing slashes.
+    # Resolving symlinks made the in-trash check wrongly flag files when a
+    # parent directory (e.g. ~/Downloads) happened to resolve through ~/trash.
+    abs=$(realpath -s -- "$arg") || exit 1
     if [[ "$abs" == "$TRASH_DIR" || "$abs" == "$TRASH_DIR"/* ]]; then
         echo "trash.sh: skipping '$arg' (already in $TRASH_DIR)" >&2
         continue
