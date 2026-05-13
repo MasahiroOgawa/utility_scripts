@@ -10,6 +10,12 @@ mkdir -p "$TRASH_DIR"
 # Move each argument into the trash, picking a unique destination name on
 # collision so the move always succeeds (and never overwrites earlier trash).
 trash_real=$(realpath -- "$TRASH_DIR")
+
+if [[ "$(realpath -- "$PWD")" == "$trash_real" ]]; then
+    echo "trash.sh: already in $TRASH_DIR; nothing to clean up." >&2
+    exit 0
+fi
+
 for arg in "$@"; do
     abs=$(realpath -- "$arg") || exit 1
     # Only skip when the file's *immediate parent* is the trash root — a file
