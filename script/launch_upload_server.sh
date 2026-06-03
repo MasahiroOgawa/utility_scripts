@@ -7,7 +7,7 @@
 #
 # NOTE: Python's uploadserver uses cgi.FieldStorage which buffers the whole
 # body in memory — reliable for small files (< ~500 MB), flaky for multi-GB.
-# For large transfers (e.g. 3D scans), use cp_3DScanner_data.sh over USB.
+# For large transfers (e.g. 3D scans), use cp_iphone_app_docs.sh over USB.
 
 SHARE_DIR="/home/mas/iphone-share"
 PORT=8000

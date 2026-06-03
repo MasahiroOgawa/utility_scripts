@@ -1,5 +1,6 @@
 #!/bin/bash
-# Pull 3DScanner app's Documents folder from iPhone over USB into this share dir.
+# Pull an iPhone app's Documents folder over USB into this share dir.
+# Edit BUNDLE_ID below to target a different app; list IDs with `ideviceinstaller -l`.
 # Requires: ifuse + libimobiledevice-utils + ideviceinstaller, and iPhone trusted.
 set -e
 
