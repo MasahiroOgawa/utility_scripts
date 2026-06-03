@@ -3,7 +3,7 @@
 # Requires: ifuse + libimobiledevice-utils + ideviceinstaller, and iPhone trusted.
 set -e
 
-BUNDLE_ID="com.ogawa.scanner3d.3SM82K4JRQ"
+BUNDLE_ID="com.dopymas.dopescan.3SM82K4JRQ"
 MOUNT_POINT="/tmp/iphone-app-docs"
 DEST_DIR="/home/mas/iphone-share"
 
