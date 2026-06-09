@@ -68,28 +68,79 @@ fi
 unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
 
 if [[ "$BACKEND" == "gemini" ]]; then
+  # All Gemini routes pinned to FLASH on purpose: gemini-2.5-pro on the free
+  # tier rate-limits at ~2 req/min and ccr then retries 10× with a 30s
+  # timeout each, producing "attempt */10 TIMEOUT_MS=..." that looks like a
+  # network hang. Flash is ~15 req/min on the free tier and handles
+  # Claude Code's thinking/long-context turns just fine. Switch a single
+  # route to gemini-2.5-pro manually at runtime when you actually need it:
+  #   /model gemini,gemini-2.5-pro
   DEFAULT_MODEL="gemini,gemini-2.5-flash"
-  THINK_MODEL="gemini,gemini-2.5-pro"
-  LONG_MODEL="gemini,gemini-2.5-pro"
+  THINK_MODEL="gemini,gemini-2.5-flash"
+  LONG_MODEL="gemini,gemini-2.5-flash"
   WEB_MODEL="gemini,gemini-2.5-flash"
   BACKGROUND_MODEL="ollama,qwen2.5-coder:14b"
 else
+  # NOTE: deepseek-r1 does NOT support tool/function calling, so it can't
+  # be used by Claude Code (which needs tools for file/shell ops). Keep
+  # think/longContext on a tools-capable model. To experiment with R1
+  # for plain Q&A, switch manually at runtime: /model ollama,deepseek-r1:14b
   DEFAULT_MODEL="ollama,qwen2.5-coder:14b"
-  THINK_MODEL="ollama,deepseek-r1:14b"
-  LONG_MODEL="ollama,deepseek-r1:14b"
+  THINK_MODEL="ollama,qwen2.5-coder:14b"
+  LONG_MODEL="ollama,qwen2.5-coder:14b"
   WEB_MODEL="ollama,qwen2.5-coder:14b"
   BACKGROUND_MODEL="ollama,llama3.1:8b"
 fi
 
 CCR_DIR="$HOME/.claude-code-router"
 mkdir -p "$CCR_DIR"
+
+# Custom transformer: Ollama's OpenAI-compatible endpoint rejects ANY request
+# whose body contains a `reasoning.effort` field on a model that doesn't
+# natively support thinking (qwen2.5-coder, gemma3, llama3.1) with:
+#   "<model>" does not support thinking
+# ccr's Anthropic→OpenAI converter ALWAYS sets `reasoning: { effort, enabled }`
+# when Claude Code sends a `thinking` block, and the built-in `reasoning`
+# transformer only ADDS fields — it can't strip `reasoning.effort`. So we
+# register this tiny plugin that deletes the offending fields before the
+# request leaves the router.
+cat > "$CCR_DIR/strip-reasoning.js" <<'JS'
+class StripReasoning {
+  constructor(options = {}) {
+    this.name = "stripreasoning";
+    this.options = options;
+  }
+  async transformRequestIn(req) {
+    delete req.reasoning;
+    delete req.reasoning_effort;
+    delete req.thinking;
+    delete req.enable_thinking;
+    return req;
+  }
+  async transformResponseOut(res) { return res; }
+}
+module.exports = StripReasoning;
+JS
 # `$GEMINI_API_KEY` is written literally so claude-code-router resolves
 # it from the env we exported above (key never lands in the file on disk).
 # The ollama provider uses a dummy "api_key": "ollama" because Ollama's
 # OpenAI-compatible endpoint ignores auth but the router requires the field.
+#
+# The per-model `stripreasoning` transformer (defined above in
+# strip-reasoning.js) is REQUIRED for qwen/gemma/llama: ccr's
+# Anthropic→OpenAI converter inserts `reasoning: { effort, enabled }`
+# whenever Claude Code sends a `thinking` block, and Ollama rejects ANY
+# `reasoning.effort` value on a non-thinking model with the cryptic
+# error: `"<model>" does not support thinking`. Built-in transformers
+# (`reasoning`, `customparams`) can only ADD/merge fields — they can't
+# delete `reasoning.effort` — so we ship a tiny custom plugin to do it.
+# deepseek-r1 is omitted because it DOES support thinking natively.
 cat > "$CCR_DIR/config.json" <<JSON
 {
-  "LOG": false,
+  "LOG": true,
+  "transformers": [
+    { "path": "$CCR_DIR/strip-reasoning.js" }
+  ],
   "Providers": [
     {
       "name": "gemini",
@@ -102,7 +153,12 @@ cat > "$CCR_DIR/config.json" <<JSON
       "name": "ollama",
       "api_base_url": "http://localhost:11434/v1/chat/completions",
       "api_key": "ollama",
-      "models": ["deepseek-r1:14b", "qwen2.5-coder:14b", "gemma3:12b", "llama3.1:8b"]
+      "models": ["deepseek-r1:14b", "qwen2.5-coder:14b", "gemma3:12b", "llama3.1:8b"],
+      "transformer": {
+        "qwen2.5-coder:14b": { "use": ["stripreasoning"] },
+        "gemma3:12b":        { "use": ["stripreasoning"] },
+        "llama3.1:8b":       { "use": ["stripreasoning"] }
+      }
     }
   ],
   "Router": {
@@ -124,12 +180,12 @@ claude-code-router · default backend: $BACKEND
   longContext → $LONG_MODEL
 
 Claude Code's /model picker can't list these — TYPE the full string:
-  /model ollama,qwen2.5-coder:14b
-  /model ollama,deepseek-r1:14b
-  /model ollama,gemma3:12b
-  /model ollama,llama3.1:8b
-  /model gemini,gemini-2.5-flash
-  /model gemini,gemini-2.5-pro
+  /model ollama,qwen2.5-coder:14b   (tools OK)
+  /model ollama,llama3.1:8b         (tools OK)
+  /model ollama,gemma3:12b          (no tools)
+  /model ollama,deepseek-r1:14b     (no tools — answers only, no file/shell)
+  /model gemini,gemini-2.5-flash   (default — 15 RPM free tier)
+  /model gemini,gemini-2.5-pro     (~2 RPM free — use sparingly)
 ─────────────────────────────────────────────────────────────
 BANNER
 
