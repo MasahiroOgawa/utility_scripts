@@ -84,21 +84,22 @@ curl -fsSL https://ollama.com/install.sh | sh
 # 2. Start the daemon (skip if installed as a systemd service)
 ollama serve &
 
-# 3. Pull models — minimum is qwen2.5-coder:14b (used by every router slot
+# 3. Pull models — minimum is qwen3:14b (used by every router slot
 #    when --local is selected; the others are optional fallbacks)
-ollama pull qwen2.5-coder:14b    # ~9 GB, coding-tuned, supports tools — REQUIRED
+ollama pull qwen3:14b            # ~9 GB, chat-balanced + tools — REQUIRED default
 ollama pull llama3.1:8b          # ~4.7 GB, background-route default
-ollama pull deepseek-r1:14b      # optional, reasoning-focused (no tools)
+ollama pull qwen2.5-coder:14b    # optional, coding-tuned (use via /model for heavy coding)
+ollama pull deepseek-r1:14b      # optional, reasoning-focused (no reliable tools)
 ollama pull gemma3:12b           # optional (no tools)
 
 # 4. Verify
 ollama list
 ```
 
-For lower-VRAM machines, swap the coder model for a smaller tag
-(`qwen2.5-coder:7b` ~4.7 GB, `qwen2.5-coder:3b` ~2 GB CPU-friendly)
-and update the `ollama` provider's `models` array in
-`script/claude_router.sh` to match.
+For lower-VRAM machines, swap qwen3:14b for a smaller tag
+(`qwen3:8b` ~5 GB, `qwen3:4b` ~2.5 GB CPU-friendly) and update the
+`ollama` provider's `models` array in `script/claude_router.sh` to
+match.
 
 To advertise different models, edit the `models` array inside the
 `ollama` block in `script/claude_router.sh`. The `/model` picker only
@@ -120,10 +121,11 @@ To switch models on the fly, **type** the command — don't use the
 arrow-key picker:
 
 ```
-/model gemini,gemini-2.5-flash       # default — cloud, fast
+/model gemini,gemini-2.5-flash       # cloud, fast (default under --cloud)
 /model gemini,gemini-2.5-pro         # cloud, deeper reasoning
-/model ollama,deepseek-r1:14b        # local fallback
+/model ollama,qwen3:14b              # local, chat-balanced (default under --local)
 /model ollama,qwen2.5-coder:14b      # local, coding-tuned
+/model ollama,deepseek-r1:14b        # local reasoning, no tools
 ```
 
 The picker UI is baked into Claude Code and only lists Anthropic
@@ -171,13 +173,13 @@ you → ./script/claude_router.sh
 Which one is used for any given turn is decided by the `Router` block
 in the config:
 
-| Slot | Default model |
-|---|---|
-| `default` | `gemini,gemini-2.5-flash` — most turns |
-| `background` | `ollama,qwen2.5-coder:14b` — title/summary subtasks; keeps free-tier quota for foreground |
-| `think` | `gemini,gemini-2.5-pro` — extended-thinking turns |
-| `longContext` | `gemini,gemini-2.5-pro` — large inputs |
-| `webSearch` | `gemini,gemini-2.5-flash` |
+| Slot | Default under `--cloud` | Default under `--local` (default) |
+|---|---|---|
+| `default` | `gemini,gemini-2.5-flash` | `ollama,qwen3:14b` |
+| `background` | `ollama,qwen2.5-coder:14b` — small/fast subtasks, keeps free-tier quota for foreground | `ollama,llama3.1:8b` |
+| `think` | `gemini,gemini-2.5-flash` (pro pinned off — see comment in script) | `ollama,qwen3:14b` |
+| `longContext` | `gemini,gemini-2.5-flash` | `ollama,qwen3:14b` |
+| `webSearch` | `gemini,gemini-2.5-flash` | `ollama,qwen3:14b` |
 
 `/model <provider>,<model>` overrides the `default` slot for the rest
 of the session.

@@ -78,6 +78,8 @@ fi
 
 # Strip ANTHROPIC_* so the underlying `claude` CLI doesn't try to call
 # api.anthropic.com directly — the router owns upstream auth from here on.
+# (ANTHROPIC_MODEL is intentionally kept and re-set below so Claude Code's
+# title bar reflects the current default route instead of stale state.)
 unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
 
 if [[ "$BACKEND" == "gemini" ]]; then
@@ -94,21 +96,34 @@ if [[ "$BACKEND" == "gemini" ]]; then
   WEB_MODEL="gemini,gemini-2.5-flash"
   BACKGROUND_MODEL="ollama,qwen2.5-coder:14b"
 else
-  # Default to llama3.1:8b rather than qwen2.5-coder: qwen is heavily
-  # tool/function-call-tuned and answers casual prompts like "hello" by
-  # inventing fake tool calls (e.g. `{"name":"greet","arguments":{...}}`)
-  # because Claude Code's system prompt is dense with tool definitions.
-  # llama3.1 is more chat-balanced. Switch to qwen at runtime for heavy
-  # coding turns: /model ollama,qwen2.5-coder:14b
-  # deepseek-r1 does NOT support tool/function calling, so it can't be
-  # used as a Claude Code default (file/shell ops break); /model into it
-  # only for plain Q&A: /model ollama,deepseek-r1:14b
-  DEFAULT_MODEL="ollama,llama3.1:8b"
-  THINK_MODEL="ollama,llama3.1:8b"
-  LONG_MODEL="ollama,llama3.1:8b"
-  WEB_MODEL="ollama,llama3.1:8b"
+  # Default to qwen3:14b: newer generation than qwen2.5-coder, chat-balanced
+  # (so casual prompts like "hello" no longer get answered with invented tool
+  # calls), supports tool/function calling, and fits comfortably in 12 GB
+  # VRAM. Background route stays on llama3.1:8b to keep small/fast model
+  # warm for title-generation and summary subtasks.
+  # qwen2.5-coder:14b is still reachable for heavy coding turns via
+  #   /model ollama,qwen2.5-coder:14b
+  # deepseek-r1 does NOT reliably emit tool calls, so it can't be used as
+  # a Claude Code default (file/shell ops break); /model into it only for
+  # plain Q&A:
+  #   /model ollama,deepseek-r1:14b
+  DEFAULT_MODEL="ollama,qwen3:14b"
+  THINK_MODEL="ollama,qwen3:14b"
+  LONG_MODEL="ollama,qwen3:14b"
+  WEB_MODEL="ollama,qwen3:14b"
   BACKGROUND_MODEL="ollama,llama3.1:8b"
 fi
+
+# Claude Code's title bar / startup banner shows whatever model name it has
+# cached — without an explicit hint it keeps showing the model from the
+# previous session (e.g. "gemini-2.5-flash" after a --cloud run, even when
+# you've since restarted under --local). Set ANTHROPIC_MODEL to the bare
+# model id (provider prefix dropped — Claude Code only renders the second
+# half) so the banner matches the route the router is actually using.
+# This is cosmetic only — ccr routes by its own Router config, not by the
+# model name in the incoming request.
+DEFAULT_MODEL_NAME="${DEFAULT_MODEL##*,}"
+export ANTHROPIC_MODEL="$DEFAULT_MODEL_NAME"
 
 CCR_DIR="$HOME/.claude-code-router"
 mkdir -p "$CCR_DIR"
@@ -190,8 +205,9 @@ cat > "$CCR_DIR/config.json" <<JSON
       "name": "ollama",
       "api_base_url": "http://localhost:11434/v1/chat/completions",
       "api_key": "ollama",
-      "models": ["deepseek-r1:14b", "qwen2.5-coder:14b", "gemma3:12b", "llama3.1:8b"],
+      "models": ["qwen3:14b", "deepseek-r1:14b", "qwen2.5-coder:14b", "gemma3:12b", "llama3.1:8b"],
       "transformer": {
+        "qwen3:14b":         { "use": ["stripreasoning"] },
         "qwen2.5-coder:14b": { "use": ["stripreasoning"] },
         "gemma3:12b":        { "use": ["stripreasoning"] },
         "llama3.1:8b":       { "use": ["stripreasoning"] }
@@ -217,7 +233,8 @@ claude-code-router · default backend: $BACKEND
   longContext → $LONG_MODEL
 
 Claude Code's /model picker can't list these — TYPE the full string:
-  /model ollama,llama3.1:8b         (tools OK — chat-balanced default)
+  /model ollama,qwen3:14b           (tools OK — chat-balanced default)
+  /model ollama,llama3.1:8b         (tools OK — lighter fallback; background route)
   /model ollama,qwen2.5-coder:14b   (tools OK — heavy coding; invents fake tool calls on casual chat)
   /model ollama,gemma3:12b          (no tools)
   /model ollama,deepseek-r1:14b     (no tools — answers only, no file/shell)
