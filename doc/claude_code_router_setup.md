@@ -1,10 +1,16 @@
 # Free Claude Code via claude-code-router
 
-Run Claude Code against Google Gemini's free tier (or any other
-OpenAI-compatible provider) without a paid Anthropic subscription.
-Scoped to this repo via `script/claude_gemini.sh`; the system-wide
-`claude` command is left untouched, so other repos keep using your
-Anthropic account.
+Run Claude Code against Google Gemini's free tier and/or a local Ollama
+model, without a paid Anthropic subscription. Scoped to this repo via
+`script/claude_router.sh`; the system-wide `claude` command is left
+untouched, so other repos keep using your Anthropic account.
+
+Two backends are wired up out of the box and switchable live with
+`/model`:
+
+- **Gemini** (cloud, free tier) — fast, needs an `AIza…` key. Default.
+- **Ollama** (local, no key) — fallback when Gemini 503s or when you're
+  offline. Uses whichever models you've already `ollama pull`'d.
 
 ## Why a router is needed
 
@@ -60,27 +66,48 @@ ANTHROPIC_API_KEY="$GEMINI_API_KEY"
 
 Order matters — `GEMINI_API_KEY` must come **before** the line that
 references it. The `set -a && source .env && set +a` loader used by
-both `script/claude_gemini.sh` and `script/start_server.sh` expands the
+both `script/claude_router.sh` and `script/start_server.sh` expands the
 `$GEMINI_API_KEY` reference at source time.
 
-### 4. Launch
+### 4. (Optional) Pull local models for the Ollama backend
+
+`claude_router.sh` writes an Ollama provider block into the router
+config even if Ollama isn't installed — the wrapper just prints a
+warning so cloud-only users keep working. To actually use the local
+backend, install Ollama and pull at least one of the models the
+wrapper advertises:
+
+```bash
+ollama pull deepseek-r1:14b      # generalist, ~9 GB, fits 12 GB VRAM
+ollama pull qwen2.5-coder:14b    # coding-tuned
+ollama pull gemma3:12b
+ollama pull llama3.1:8b
+```
+
+To advertise different models, edit the `models` array inside the
+`ollama` block in `script/claude_router.sh`. The `/model` picker only
+offers names listed there.
+
+### 5. Launch
 
 From the repo root:
 
 ```bash
-./script/claude_gemini.sh
+./script/claude_router.sh
 ```
 
 That sources `.env`, regenerates `~/.claude-code-router/config.json`
-with the Gemini provider, restarts the router daemon, and `exec`s
-`ccr code` (which launches Claude Code pointed at the router).
+with both providers, restarts the router daemon, and `exec`s `ccr code`
+(which launches Claude Code pointed at the router).
 
 To switch models on the fly, **type** the command — don't use the
 arrow-key picker:
 
 ```
-/model gemini,gemini-2.5-pro
-/model gemini,gemini-2.5-flash
+/model gemini,gemini-2.5-flash       # default — cloud, fast
+/model gemini,gemini-2.5-pro         # cloud, deeper reasoning
+/model ollama,deepseek-r1:14b        # local fallback
+/model ollama,qwen2.5-coder:14b      # local, coding-tuned
 ```
 
 The picker UI is baked into Claude Code and only lists Anthropic
@@ -90,32 +117,49 @@ models; it doesn't know about routed providers. The typed
 The wrapper writes the config with `"api_key": "$GEMINI_API_KEY"`
 literally — the router resolves the variable at config-load time from
 the env we exported, so the API key never lands on disk in plaintext.
+The Ollama block uses a dummy `"api_key": "ollama"` because the local
+endpoint ignores auth but the router still requires the field.
 
 ## How it works
 
 ```
-you → ./script/claude_gemini.sh
+you → ./script/claude_router.sh
        ├─ sources .env  (GEMINI_API_KEY into env)
-       ├─ writes ~/.claude-code-router/config.json
+       ├─ writes ~/.claude-code-router/config.json  (gemini + ollama)
        ├─ ccr stop && ccr code
        ▼
    ccr daemon on 127.0.0.1:3456  (Anthropic-format in)
-       │ translates /v1/messages ⇄ Gemini native
-       ▼
-   https://generativelanguage.googleapis.com/v1beta/models/
+       │ translates /v1/messages ⇄ provider native
+       ├──► https://generativelanguage.googleapis.com/v1beta/models/    (gemini)
+       └──► http://localhost:11434/v1/chat/completions                  (ollama)
 ```
+
+Which one is used for any given turn is decided by the `Router` block
+in the config:
+
+| Slot | Default model |
+|---|---|
+| `default` | `gemini,gemini-2.5-flash` — most turns |
+| `background` | `ollama,qwen2.5-coder:14b` — title/summary subtasks; keeps free-tier quota for foreground |
+| `think` | `gemini,gemini-2.5-pro` — extended-thinking turns |
+| `longContext` | `gemini,gemini-2.5-pro` — large inputs |
+| `webSearch` | `gemini,gemini-2.5-flash` |
+
+`/model <provider>,<model>` overrides the `default` slot for the rest
+of the session.
 
 `ccr code` exports `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` and
 launches the regular `claude` binary, which talks to the router as if
 it were Anthropic.
 
-## Using a different free LLM
+## Adding more providers
 
-`script/claude_gemini.sh` hard-codes a Gemini provider block. To use a
-different backend, edit the heredoc in the wrapper (or maintain
-`~/.claude-code-router/config.json` by hand). The router ships
-transformers for many providers and supports `"$ENV_VAR"` substitution
-in config values, so secrets stay in `.env`.
+`script/claude_router.sh` hard-codes the Gemini + Ollama provider
+blocks. To add a third (or replace one), append to the `Providers`
+array in the heredoc (or maintain `~/.claude-code-router/config.json`
+by hand). The router ships transformers for many providers and
+supports `"$ENV_VAR"` substitution in config values, so secrets stay
+in `.env`.
 
 - **OpenRouter** — mixed free / paid models. Key from
   <https://openrouter.ai>.
@@ -134,17 +178,11 @@ in config values, so secrets stay in `.env`.
   }
   ```
 
-- **Ollama** — fully local, no key needed. Same backend Kokuuz uses for
-  the summariser when `llm.provider: local`.
-
-  ```json
-  {
-    "name": "ollama",
-    "api_base_url": "http://localhost:11434/v1/chat/completions",
-    "api_key": "ollama",
-    "models": ["deepseek-r1:14b", "qwen3:14b"]
-  }
-  ```
+- **Ollama** — already wired in. To advertise different local models,
+  edit the `models` array in the `ollama` block of
+  `script/claude_router.sh`; whatever you list there shows up under
+  `/model ollama,<name>`. Same backend Kokuuz uses for the summariser
+  when `llm.provider: local`.
 
 - **DeepSeek**, **Volcengine**, **SiliconFlow** — see the
   `claude-code-router` README for transformer names and base URLs.
@@ -193,6 +231,23 @@ same format and let you split roles across providers.
 - **HTTP 429 / rate limit** — free Gemini tier is ~15 req/min. Pace
   agentic workflows, or pay for a higher tier (still well below Claude
   pricing for most usage).
+
+- **Claude Code shows `attempting N/10 TIMEOUT+…` and never replies** —
+  almost always Gemini returning HTTP 503 ("This model is currently
+  experiencing high demand"). Claude Code groups 5xx + real timeouts
+  under `TIMEOUT+` and retries with backoff. Confirm by probing the
+  router directly:
+
+  ```bash
+  curl -sS -m 10 -X POST http://127.0.0.1:3456/v1/messages \
+    -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+    -d '{"model":"gemini,gemini-2.5-flash","max_tokens":32,
+         "messages":[{"role":"user","content":"ping"}]}'
+  ```
+
+  Fix: type `/model ollama,deepseek-r1:14b` (or any other local model)
+  to fall back to Ollama while Gemini is overloaded. Switch back with
+  `/model gemini,gemini-2.5-flash` when it recovers.
 
 - **Router log** lives at `~/.claude-code-router/claude-code-router.log`
   when `"LOG": true` is set in `config.json` (the wrapper sets it to
