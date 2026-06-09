@@ -102,27 +102,28 @@ fi
 CCR_DIR="$HOME/.claude-code-router"
 mkdir -p "$CCR_DIR"
 
-# Custom transformer with two distinct jobs depending on the destination
-# model — Ollama and Gemini both need a tweak, but in opposite directions:
+# Custom transformer for Ollama models only. Ollama's OpenAI-compatible
+# endpoint rejects ANY request whose body contains `reasoning.effort`
+# on a non-thinking model (qwen, gemma, llama3.1) with the cryptic
+# error: `"<model>" does not support thinking`. ccr's Anthropic→OpenAI
+# converter ALWAYS sets `reasoning: { effort, enabled }` when Claude
+# Code sends `thinking`, and the built-in `reasoning` transformer can
+# only ADD fields, not strip them — so we delete the offending fields
+# outright before the request leaves the router.
 #
-# Ollama (OpenAI-compatible endpoint): rejects ANY request whose body
-# contains `reasoning.effort` on a non-thinking model (qwen, gemma,
-# llama3.1) with: `"<model>" does not support thinking`. ccr's
-# Anthropic→OpenAI converter ALWAYS sets `reasoning: { effort, enabled }`
-# when Claude Code sends `thinking`, and the built-in `reasoning`
-# transformer can only ADD fields, not strip them — so we delete the
-# offending fields outright before the request leaves the router.
-#
-# Gemini-2.5-flash: when `thinking` is passed through, flash sometimes
-# streams only reasoning_tokens and emits zero text content blocks
-# before `end_turn` — Claude Code then renders a bare "Thought for Xs"
-# with no answer. We want to force thinking-off. We CANNOT `delete
-# req.thinking` here because ccr's gemini transformer reads
-# `req.thinking` to build Gemini's `thinkingConfig`, and a missing field
-# crashes the transformer with `Cannot read properties of undefined
-# (reading 'filter')` → HTTP 500 → Claude Code's "TIMEOUT_MS" retry loop.
-# So for Gemini we REPLACE `req.thinking` with `{ type: "disabled" }`
-# instead of removing it — preserves the shape, signals no thinking.
+# This transformer is NOT applied to Gemini. The `gemini` transformer
+# in ccr is a complete Anthropic→Gemini converter that expects the
+# request still in Anthropic format (it walks `tools[i].name`,
+# `messages[i].role`, etc. directly). Slotting any custom transformer
+# in front of it bypasses an internal pre-pass and makes `gD()` crash
+# on `a.function.name` / `e.messages.filter` with TypeErrors that
+# surface to Claude Code as 500s ("attempting N/10 TIMEOUT_MS=...").
+# To suppress Gemini thinking we would need to set `reasoning.effort`
+# to "none" AFTER ccr's converter has run, which isn't reachable from
+# a transformer plugin. So we leave Gemini alone and accept that
+# gemini-2.5-flash occasionally emits a thinking-only response with
+# no text content (Claude Code shows "Thought for Xs" and nothing).
+# Workarounds: retype the question, or `/model gemini,gemini-2.5-pro`.
 #
 # deepseek-r1 is omitted from the Ollama side because it supports
 # thinking natively.
@@ -135,13 +136,8 @@ class StripReasoning {
   async transformRequestIn(req) {
     delete req.reasoning;
     delete req.reasoning_effort;
+    delete req.thinking;
     delete req.enable_thinking;
-    const model = typeof req.model === "string" ? req.model : "";
-    if (model.startsWith("gemini")) {
-      req.thinking = { type: "disabled" };
-    } else {
-      delete req.thinking;
-    }
     return req;
   }
   async transformResponseOut(res) { return res; }
@@ -162,17 +158,9 @@ JS
 # (`reasoning`, `customparams`) can only ADD/merge fields — they can't
 # delete `reasoning.effort` — so we ship a tiny custom plugin to do it.
 # deepseek-r1 is omitted because it DOES support thinking natively.
-#
-# gemini-2.5-flash also gets `stripreasoning` for a different reason:
-# when Claude Code's `thinking` block is translated through to Flash, the
-# model sometimes streams reasoning_tokens only and emits zero text
-# content blocks before `end_turn` — Claude Code then renders just
-# "Thought for Xs" with no answer. Flash still reasons internally by
-# default (Gemini 2.5 thinking is built-in), so stripping the explicit
-# instruction just removes the failure mode. gemini-2.5-pro is left
-# untouched: its thinking is stable, the free-tier rate limit (~2 RPM)
-# already discourages casual use, and on the hard turns where you
-# manually switch to pro you want full extended-thinking active.
+# Gemini is NOT included — its `gemini` transformer is incompatible
+# with any custom pre-transformer (see the strip-reasoning.js comment
+# above for the full story).
 cat > "$CCR_DIR/config.json" <<JSON
 {
   "LOG": true,
@@ -185,10 +173,7 @@ cat > "$CCR_DIR/config.json" <<JSON
       "api_base_url": "https://generativelanguage.googleapis.com/v1beta/models/",
       "api_key": "\$GEMINI_API_KEY",
       "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
-      "transformer": {
-        "use": ["gemini"],
-        "gemini-2.5-flash": { "use": ["stripreasoning", "gemini"] }
-      }
+      "transformer": { "use": ["gemini"] }
     },
     {
       "name": "ollama",
@@ -225,8 +210,8 @@ Claude Code's /model picker can't list these — TYPE the full string:
   /model ollama,qwen2.5-coder:14b   (tools OK — heavy coding; invents fake tool calls on casual chat)
   /model ollama,gemma3:12b          (no tools)
   /model ollama,deepseek-r1:14b     (no tools — answers only, no file/shell)
-  /model gemini,gemini-2.5-flash    (15 RPM free tier — thinking forced off)
-  /model gemini,gemini-2.5-pro      (~2 RPM free — use sparingly, thinking on)
+  /model gemini,gemini-2.5-flash    (15 RPM free tier — sometimes returns thinking-only/empty answers; retype to retry)
+  /model gemini,gemini-2.5-pro      (~2 RPM free — use sparingly; stable thinking)
 ─────────────────────────────────────────────────────────────
 BANNER
 
