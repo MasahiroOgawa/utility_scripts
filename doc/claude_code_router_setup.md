@@ -74,15 +74,31 @@ both `script/claude_router.sh` and `script/start_server.sh` expands the
 `claude_router.sh` writes an Ollama provider block into the router
 config even if Ollama isn't installed — the wrapper just prints a
 warning so cloud-only users keep working. To actually use the local
-backend, install Ollama and pull at least one of the models the
-wrapper advertises:
+backend, install Ollama, make sure the daemon is running, and pull at
+least one of the models the wrapper advertises:
 
 ```bash
-ollama pull deepseek-r1:14b      # generalist, ~9 GB, fits 12 GB VRAM
-ollama pull qwen2.5-coder:14b    # coding-tuned
-ollama pull gemma3:12b
-ollama pull llama3.1:8b
+# 1. Install Ollama (Linux/macOS — Windows: download installer from ollama.com)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 2. Start the daemon (skip if installed as a systemd service)
+ollama serve &
+
+# 3. Pull models — minimum is qwen2.5-coder:14b (used by every router slot
+#    when --local is selected; the others are optional fallbacks)
+ollama pull qwen2.5-coder:14b    # ~9 GB, coding-tuned, supports tools — REQUIRED
+ollama pull llama3.1:8b          # ~4.7 GB, background-route default
+ollama pull deepseek-r1:14b      # optional, reasoning-focused (no tools)
+ollama pull gemma3:12b           # optional (no tools)
+
+# 4. Verify
+ollama list
 ```
+
+For lower-VRAM machines, swap the coder model for a smaller tag
+(`qwen2.5-coder:7b` ~4.7 GB, `qwen2.5-coder:3b` ~2 GB CPU-friendly)
+and update the `ollama` provider's `models` array in
+`script/claude_router.sh` to match.
 
 To advertise different models, edit the `models` array inside the
 `ollama` block in `script/claude_router.sh`. The `/model` picker only
