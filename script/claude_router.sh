@@ -51,6 +51,17 @@ export GEMINI_API_KEY
 
 command -v ccr >/dev/null || { echo "ERROR: ccr not on PATH. Install once with: bun install -g @musistudio/claude-code-router" >&2; exit 1; }
 
+# ccr spawns the `claude` CLI via `child_process.spawn("claude", ..., {shell:true})`,
+# which goes through `/bin/sh -c "claude ..."`. If claude was installed under a
+# Node-version-managed prefix (nvm, fnm, asdf) that is only added to PATH by
+# the user's interactive shell rc, sh fails to resolve `claude` and dies with
+# `/bin/sh: 1: claude: not found` — regardless of what the parent script's
+# PATH looks like. ccr honors $CLAUDE_PATH as an absolute-path override; set
+# it from `command -v` so the spawn never has to do its own PATH lookup.
+CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+[[ -n "$CLAUDE_BIN" ]] || { echo "ERROR: 'claude' CLI not on PATH. Install once with: bun install -g @anthropic-ai/claude-code" >&2; exit 1; }
+export CLAUDE_PATH="$CLAUDE_BIN"
+
 OLLAMA_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
 OLLAMA_REACHABLE=1
 curl -sS -m 2 "$OLLAMA_URL/api/tags" >/dev/null 2>&1 || OLLAMA_REACHABLE=0
