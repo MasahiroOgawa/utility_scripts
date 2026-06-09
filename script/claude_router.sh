@@ -33,7 +33,9 @@ for arg in "$@"; do
   esac
 done
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve through symlinks so this works when invoked via e.g. ~/bin/claude_router.sh.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ENV_FILE="$REPO_ROOT/.env"
@@ -135,6 +137,17 @@ JS
 # (`reasoning`, `customparams`) can only ADD/merge fields — they can't
 # delete `reasoning.effort` — so we ship a tiny custom plugin to do it.
 # deepseek-r1 is omitted because it DOES support thinking natively.
+#
+# gemini-2.5-flash also gets `stripreasoning` for a different reason:
+# when Claude Code's `thinking` block is translated through to Flash, the
+# model sometimes streams reasoning_tokens only and emits zero text
+# content blocks before `end_turn` — Claude Code then renders just
+# "Thought for Xs" with no answer. Flash still reasons internally by
+# default (Gemini 2.5 thinking is built-in), so stripping the explicit
+# instruction just removes the failure mode. gemini-2.5-pro is left
+# untouched: its thinking is stable, the free-tier rate limit (~2 RPM)
+# already discourages casual use, and on the hard turns where you
+# manually switch to pro you want full extended-thinking active.
 cat > "$CCR_DIR/config.json" <<JSON
 {
   "LOG": true,
@@ -147,7 +160,10 @@ cat > "$CCR_DIR/config.json" <<JSON
       "api_base_url": "https://generativelanguage.googleapis.com/v1beta/models/",
       "api_key": "\$GEMINI_API_KEY",
       "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
-      "transformer": { "use": ["gemini"] }
+      "transformer": {
+        "use": ["gemini"],
+        "gemini-2.5-flash": { "use": ["stripreasoning", "gemini"] }
+      }
     },
     {
       "name": "ollama",

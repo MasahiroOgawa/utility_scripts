@@ -130,6 +130,24 @@ The picker UI is baked into Claude Code and only lists Anthropic
 models; it doesn't know about routed providers. The typed
 `provider,model` form is intercepted by the router daemon.
 
+### 6. (Optional) Launch from any directory
+
+Symlink the wrapper into a directory on your `PATH` so you can run it
+from any project — e.g. `cd ~/work/Kokuuz && claude_router.sh` — and
+Claude Code will read/edit files in *that* directory while still
+sourcing `.env` and the provider config from this repo:
+
+```bash
+ln -s /home/mas/proj/study/utility_scripts/script/claude_router.sh ~/bin/claude_router.sh
+```
+
+(Adjust the source path if your checkout lives elsewhere; make sure
+`~/bin` is on `PATH`.) The script resolves its own location via
+`readlink -f`, so the symlink correctly points back to the repo's
+`.env`. The working directory (where Claude Code sees your code) is
+inherited from wherever you ran the command — independent of the
+script's actual file location.
+
 The wrapper writes the config with `"api_key": "$GEMINI_API_KEY"`
 literally — the router resolves the variable at config-load time from
 the env we exported, so the API key never lands on disk in plaintext.
