@@ -83,29 +83,49 @@ if [[ "$BACKEND" == "gemini" ]]; then
   WEB_MODEL="gemini,gemini-2.5-flash"
   BACKGROUND_MODEL="ollama,qwen2.5-coder:14b"
 else
-  # NOTE: deepseek-r1 does NOT support tool/function calling, so it can't
-  # be used by Claude Code (which needs tools for file/shell ops). Keep
-  # think/longContext on a tools-capable model. To experiment with R1
-  # for plain Q&A, switch manually at runtime: /model ollama,deepseek-r1:14b
-  DEFAULT_MODEL="ollama,qwen2.5-coder:14b"
-  THINK_MODEL="ollama,qwen2.5-coder:14b"
-  LONG_MODEL="ollama,qwen2.5-coder:14b"
-  WEB_MODEL="ollama,qwen2.5-coder:14b"
+  # Default to llama3.1:8b rather than qwen2.5-coder: qwen is heavily
+  # tool/function-call-tuned and answers casual prompts like "hello" by
+  # inventing fake tool calls (e.g. `{"name":"greet","arguments":{...}}`)
+  # because Claude Code's system prompt is dense with tool definitions.
+  # llama3.1 is more chat-balanced. Switch to qwen at runtime for heavy
+  # coding turns: /model ollama,qwen2.5-coder:14b
+  # deepseek-r1 does NOT support tool/function calling, so it can't be
+  # used as a Claude Code default (file/shell ops break); /model into it
+  # only for plain Q&A: /model ollama,deepseek-r1:14b
+  DEFAULT_MODEL="ollama,llama3.1:8b"
+  THINK_MODEL="ollama,llama3.1:8b"
+  LONG_MODEL="ollama,llama3.1:8b"
+  WEB_MODEL="ollama,llama3.1:8b"
   BACKGROUND_MODEL="ollama,llama3.1:8b"
 fi
 
 CCR_DIR="$HOME/.claude-code-router"
 mkdir -p "$CCR_DIR"
 
-# Custom transformer: Ollama's OpenAI-compatible endpoint rejects ANY request
-# whose body contains a `reasoning.effort` field on a model that doesn't
-# natively support thinking (qwen2.5-coder, gemma3, llama3.1) with:
-#   "<model>" does not support thinking
-# ccr's Anthropic→OpenAI converter ALWAYS sets `reasoning: { effort, enabled }`
-# when Claude Code sends a `thinking` block, and the built-in `reasoning`
-# transformer only ADDS fields — it can't strip `reasoning.effort`. So we
-# register this tiny plugin that deletes the offending fields before the
-# request leaves the router.
+# Custom transformer with two distinct jobs depending on the destination
+# model — Ollama and Gemini both need a tweak, but in opposite directions:
+#
+# Ollama (OpenAI-compatible endpoint): rejects ANY request whose body
+# contains `reasoning.effort` on a non-thinking model (qwen, gemma,
+# llama3.1) with: `"<model>" does not support thinking`. ccr's
+# Anthropic→OpenAI converter ALWAYS sets `reasoning: { effort, enabled }`
+# when Claude Code sends `thinking`, and the built-in `reasoning`
+# transformer can only ADD fields, not strip them — so we delete the
+# offending fields outright before the request leaves the router.
+#
+# Gemini-2.5-flash: when `thinking` is passed through, flash sometimes
+# streams only reasoning_tokens and emits zero text content blocks
+# before `end_turn` — Claude Code then renders a bare "Thought for Xs"
+# with no answer. We want to force thinking-off. We CANNOT `delete
+# req.thinking` here because ccr's gemini transformer reads
+# `req.thinking` to build Gemini's `thinkingConfig`, and a missing field
+# crashes the transformer with `Cannot read properties of undefined
+# (reading 'filter')` → HTTP 500 → Claude Code's "TIMEOUT_MS" retry loop.
+# So for Gemini we REPLACE `req.thinking` with `{ type: "disabled" }`
+# instead of removing it — preserves the shape, signals no thinking.
+#
+# deepseek-r1 is omitted from the Ollama side because it supports
+# thinking natively.
 cat > "$CCR_DIR/strip-reasoning.js" <<'JS'
 class StripReasoning {
   constructor(options = {}) {
@@ -115,8 +135,13 @@ class StripReasoning {
   async transformRequestIn(req) {
     delete req.reasoning;
     delete req.reasoning_effort;
-    delete req.thinking;
     delete req.enable_thinking;
+    const model = typeof req.model === "string" ? req.model : "";
+    if (model.startsWith("gemini")) {
+      req.thinking = { type: "disabled" };
+    } else {
+      delete req.thinking;
+    }
     return req;
   }
   async transformResponseOut(res) { return res; }
@@ -196,12 +221,12 @@ claude-code-router · default backend: $BACKEND
   longContext → $LONG_MODEL
 
 Claude Code's /model picker can't list these — TYPE the full string:
-  /model ollama,qwen2.5-coder:14b   (tools OK)
-  /model ollama,llama3.1:8b         (tools OK)
+  /model ollama,llama3.1:8b         (tools OK — chat-balanced default)
+  /model ollama,qwen2.5-coder:14b   (tools OK — heavy coding; invents fake tool calls on casual chat)
   /model ollama,gemma3:12b          (no tools)
   /model ollama,deepseek-r1:14b     (no tools — answers only, no file/shell)
-  /model gemini,gemini-2.5-flash   (default — 15 RPM free tier)
-  /model gemini,gemini-2.5-pro     (~2 RPM free — use sparingly)
+  /model gemini,gemini-2.5-flash    (15 RPM free tier — thinking forced off)
+  /model gemini,gemini-2.5-pro      (~2 RPM free — use sparingly, thinking on)
 ─────────────────────────────────────────────────────────────
 BANNER
 
