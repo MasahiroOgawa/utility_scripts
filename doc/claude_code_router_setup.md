@@ -184,6 +184,18 @@ in the config:
 `/model <provider>,<model>` overrides the `default` slot for the rest
 of the session.
 
+A second custom transformer (`use-webfetch.js`, written by the wrapper
+alongside `strip-reasoning.js`) handles a separate Ollama quirk:
+safety-RLHF'd local models like qwen3 refuse to call `WebFetch` when
+the user pastes a URL — they answer "I cannot access external
+websites" even though `WebFetch` is in their tools list. The
+transformer detects when the latest user message contains a URL AND
+`WebFetch` is available, then appends a short system instruction
+telling the model the tool IS available and must be used. Scoped to
+qwen3, qwen2.5-coder, and llama3.1; not applied to gemini (no
+refusal problem) or gemma3/deepseek-r1 (no tool support to begin
+with).
+
 `ccr code` exports `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` and
 launches the regular `claude` binary, which talks to the router as if
 it were Anthropic.
