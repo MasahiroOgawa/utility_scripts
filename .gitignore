@@ -2,3 +2,7 @@
 downloaded_segments/
 .env
 .aider*
+
+# benchmark outputs (generated)
+bench_out/
+__pycache__/
