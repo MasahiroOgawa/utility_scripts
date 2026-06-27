@@ -589,91 +589,110 @@ def _mux_segments(work: str, total: int, out_path: str, prog: Progress):
 # GUI — browser-based, so it needs no native toolkit and runs anywhere on the
 # uv-managed Python with just `uv sync` (the engine logic above is reused as-is).
 # --------------------------------------------------------------------------- #
+MAX_PARALLEL = 4   # most downloads running at once; extras queue and wait
+
+
+class Job:
+    """One download. Up to MAX_PARALLEL run concurrently; the rest queue."""
+
+    def __init__(self, jid: int, cand: Candidate):
+        self.id = jid
+        self.title = cand.title or f"job {jid}"
+        self.cand = cand
+        self.stop_event = threading.Event()
+        self.phase = "queued"   # queued|downloading|done|stopped|error
+        self.progress = 0.0
+        self.status = "queued"
+        self.final_path: Optional[str] = None
+        self.error: Optional[str] = None
+
+
 class GuiState:
     """Shared server-side state for the browser UI, mutated by worker threads."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
+        self.sem = threading.Semaphore(MAX_PARALLEL)
+        self.jobs: dict[int, Job] = {}
+        self.order: list[int] = []
+        self.next_id = 1
         self.candidates: list[Candidate] = []
         self.thumbs: dict[int, Optional[bytes]] = {}
         self.outdir = DEFAULT_OUTDIR
-        self.phase = "idle"   # idle|probing|choose|downloading|done|stopped|error
-        self.progress = 0.0
-        self.status = "idle"
+        self.probe_phase = "idle"   # idle|probing|choose|error
+        self.probe_status = "idle"
+        self.probe_error: Optional[str] = None
         self.logs: list[str] = []
-        self.final_path: Optional[str] = None
-        self.error: Optional[str] = None
 
     def log(self, msg: str):
         with self.lock:
             self.logs.append(msg)
 
-    def reset(self):
-        self.stop_event.clear()
-        self.candidates = []
-        self.thumbs = {}
-        self.phase = "idle"
-        self.progress = 0.0
-        self.status = ""
-        self.logs = []
-        self.final_path = None
-        self.error = None
 
-
-def _gui_start_download(state: GuiState, cand: Candidate):
-    state.stop_event.clear()
-    state.phase = "downloading"
-    state.progress = 0.0
-    state.status = "starting…"
+def _gui_start_job(state: GuiState, cand: Candidate) -> Job:
+    with state.lock:
+        jid = state.next_id
+        state.next_id += 1
+        job = Job(jid, cand)
+        state.jobs[jid] = job
+        state.order.append(jid)
 
     def on_progress(pct, status):
-        state.progress = pct
-        state.status = status
+        job.progress = pct
+        job.status = status
 
-    prog = Progress(on_progress, state.log, state.stop_event)
+    def jlog(msg):
+        state.log(f"[{job.title[:28]}] {msg}")
 
     def work():
+        job.phase = "queued"
+        job.status = "queued — waiting for a free slot"
+        state.sem.acquire()
         try:
-            path = download(cand, state.outdir or DEFAULT_OUTDIR, prog)
-            state.final_path = path
-            state.status = "finished ✓"
-            state.phase = "done"
+            if job.stop_event.is_set():        # stopped while still queued
+                job.phase, job.status = "stopped", "stopped"
+                return
+            job.phase, job.status = "downloading", "starting…"
+            prog = Progress(on_progress, jlog, job.stop_event)
+            job.final_path = download(cand, state.outdir or DEFAULT_OUTDIR, prog)
+            job.progress, job.phase, job.status = 100.0, "done", "finished ✓"
         except StopDownload:
-            state.status = "stopped — click Download again to resume"
-            state.phase = "stopped"
+            job.phase, job.status = "stopped", "stopped — start it again to resume"
         except Exception as exc:
-            state.error = str(exc)
-            state.status = "error"
-            state.phase = "error"
+            job.error, job.phase, job.status = str(exc), "error", f"error: {exc}"
+        finally:
+            state.sem.release()
 
-    state.thread = threading.Thread(target=work, daemon=True)
-    state.thread.start()
+    threading.Thread(target=work, daemon=True).start()
+    return job
 
 
 def _gui_start_probe(state: GuiState, url: str):
-    state.reset()
-    state.phase = "probing"
-    state.status = "probing…"
+    with state.lock:
+        state.candidates = []
+        state.thumbs = {}
+    state.probe_phase = "probing"
+    state.probe_status = "probing…"
+    state.probe_error = None
     state.log(f"Probing {url}")
 
     def work():
         try:
             cands = probe(url, state.log)
-            state.candidates = cands
+            with state.lock:
+                state.candidates = cands
             if not cands:
-                state.error = "No downloadable media found."
-                state.phase = "error"
+                state.probe_phase, state.probe_error = "error", "No downloadable media found."
             elif len(cands) == 1:
                 state.log(f"Found: {cands[0].label}")
-                _gui_start_download(state, cands[0])
+                state.probe_phase = "idle"
+                _gui_start_job(state, cands[0])
             else:
-                state.log(f"{len(cands)} candidates found — choose one.")
-                state.phase = "choose"
+                state.log(f"{len(cands)} candidates — pick any (up to "
+                          f"{MAX_PARALLEL} download at once).")
+                state.probe_phase = "choose"
         except Exception as exc:
-            state.error = str(exc)
-            state.phase = "error"
+            state.probe_phase, state.probe_error = "error", str(exc)
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -686,13 +705,18 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
  input[type=text]{flex:1;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
  button{padding:8px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
  button.sec{background:#e5e7eb;color:#111} button:disabled{opacity:.5;cursor:default}
- #bar{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden;margin:6px 0}
- #fill{height:100%;width:0;background:#2563eb;transition:width .2s}
- #pct{font-size:13px;color:#374151;min-height:18px}
- pre#log{background:#0b1020;color:#cbd5e1;padding:10px;border-radius:6px;height:220px;overflow:auto;font-size:12px;white-space:pre-wrap}
+ pre#log{background:#0b1020;color:#cbd5e1;padding:10px;border-radius:6px;height:180px;overflow:auto;font-size:12px;white-space:pre-wrap}
  .cand{display:flex;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:8px;padding:8px;margin:6px 0}
  .cand img{width:120px;height:68px;object-fit:cover;background:#e5e7eb;border-radius:4px}
- .cand .lbl{flex:1;font-size:13px} #cands{margin:10px 0}
+ .cand .lbl{flex:1;font-size:13px} #cands,#jobs{margin:10px 0}
+ .job{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;margin:6px 0}
+ .job .top{display:flex;gap:8px;align-items:center}
+ .job .ttl{flex:1;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .bar{height:12px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin:6px 0 2px}
+ .fill{height:100%;width:0;background:#2563eb;transition:width .2s}
+ .fill.done{background:#16a34a} .fill.error{background:#dc2626} .fill.stopped{background:#9ca3af}
+ .job .st{font-size:12px;color:#374151;min-height:16px}
+ .hint{font-size:12px;color:#6b7280}
 </style></head><body>
 <h1>Allround Downloader</h1>
 <div class="row">
@@ -704,11 +728,10 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 <div class="row">
  <button id="dl" onclick="start()">Download</button>
- <button id="stop" class="sec" onclick="stop()" disabled>Stop</button>
+ <span class="hint" id="hint"></span>
 </div>
-<div id="bar"><div id="fill"></div></div>
-<div id="pct">idle</div>
 <div id="cands"></div>
+<div id="jobs"></div>
 <pre id="log"></pre>
 <script>
 const $=id=>document.getElementById(id);
@@ -717,37 +740,60 @@ const q=p=>p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
 async function paste(){ try{ $('url').value=(await navigator.clipboard.readText()).trim(); }catch(e){} }
 async function start(){
   const url=$('url').value.trim(); if(!url) return;
-  $('cands').innerHTML='';
   await fetch(q('/probe'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({url, outdir:$('outdir').value.trim()})});
 }
-async function stop(){ await fetch(q('/stop'),{method:'POST'}); }
-async function pick(i){ $('cands').innerHTML=''; await fetch(q('/select'),{method:'POST',
+async function pick(i){ await fetch(q('/select'),{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}); }
+async function stop(id){ await fetch(q('/stop'),{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
 let shownChoose=false;
 function renderCands(cands){
   if(shownChoose) return; shownChoose=true;
   const box=$('cands'); box.textContent='';
-  const h=document.createElement('b'); h.textContent='Choose the video to download:'; box.appendChild(h);
+  const h=document.createElement('b');
+  h.textContent='Choose video(s) to download — click several to queue them:';
+  box.appendChild(h);
   cands.forEach(c=>{
     const d=document.createElement('div'); d.className='cand';
     const img=document.createElement('img'); img.loading='lazy';
     img.src=q('/thumb?index='+encodeURIComponent(c.index));
     const lbl=document.createElement('div'); lbl.className='lbl'; lbl.textContent=c.label;
     const btn=document.createElement('button'); btn.textContent='Download';
-    btn.onclick=()=>pick(c.index);
+    btn.onclick=()=>{ pick(c.index); btn.textContent='Queued ✓'; };
     d.append(img,lbl,btn); box.appendChild(d);
+  });
+}
+function renderJobs(jobs){
+  const box=$('jobs'); box.textContent='';
+  jobs.forEach(j=>{
+    const d=document.createElement('div'); d.className='job';
+    const top=document.createElement('div'); top.className='top';
+    const t=document.createElement('div'); t.className='ttl'; t.textContent='#'+j.id+'  '+j.title;
+    top.appendChild(t);
+    if(j.phase==='queued'||j.phase==='downloading'){
+      const b=document.createElement('button'); b.className='sec'; b.textContent='Stop';
+      b.onclick=()=>stop(j.id); top.appendChild(b);
+    }
+    const bar=document.createElement('div'); bar.className='bar';
+    const fill=document.createElement('div'); fill.className='fill '+j.phase;
+    fill.style.width=j.progress.toFixed(1)+'%'; bar.appendChild(fill);
+    const st=document.createElement('div'); st.className='st';
+    st.textContent=j.progress.toFixed(1)+'%  '+j.status;
+    d.append(top,bar,st); box.appendChild(d);
   });
 }
 async function poll(){
   try{
     const s=await (await fetch(q('/status'))).json();
-    $('fill').style.width=s.progress.toFixed(1)+'%';
-    $('pct').textContent=s.progress.toFixed(1)+'%  '+s.status;
+    $('dl').disabled=(s.probe_phase==='probing');
+    $('hint').textContent=(s.probe_phase==='probing'?'probing…':
+      (s.probe_error?('error: '+s.probe_error):
+       (s.running+' of '+s.max_parallel+' slots busy'+(s.queued?(', '+s.queued+' queued'):''))));
     $('log').textContent=s.logs; $('log').scrollTop=$('log').scrollHeight;
-    $('dl').disabled=(s.phase==='probing'||s.phase==='downloading');
-    $('stop').disabled=(s.phase!=='downloading');
-    if(s.phase==='choose') renderCands(s.candidates); else if(s.phase!=='choose') shownChoose=false;
+    renderJobs(s.jobs);
+    if(s.probe_phase==='choose') renderCands(s.candidates);
+    else if(s.probe_phase!=='choose'){ shownChoose=false; $('cands').textContent=''; }
   }catch(e){}
   setTimeout(poll,400);
 }
@@ -805,15 +851,22 @@ def run_gui(initial_url: str = ""):
                 self._send(200, "text/html; charset=utf-8", html())
             elif path == "/status":
                 with state.lock:
+                    jobs = [state.jobs[j] for j in state.order]
+                    running = sum(1 for j in jobs if j.phase == "downloading")
+                    queued = sum(1 for j in jobs if j.phase == "queued")
                     self._json(200, {
-                        "phase": state.phase,
-                        "progress": state.progress,
-                        "status": state.status,
+                        "probe_phase": state.probe_phase,
+                        "probe_status": state.probe_status,
+                        "probe_error": state.probe_error,
+                        "max_parallel": MAX_PARALLEL,
+                        "running": running,
+                        "queued": queued,
                         "logs": "\n".join(state.logs[-300:]),
                         "candidates": [{"index": i, "label": c.label}
                                        for i, c in enumerate(state.candidates)],
-                        "final_path": state.final_path,
-                        "error": state.error,
+                        "jobs": [{"id": j.id, "title": j.title, "phase": j.phase,
+                                  "progress": j.progress, "status": j.status}
+                                 for j in jobs],
                     })
             elif path == "/thumb":
                 try:
@@ -843,10 +896,13 @@ def run_gui(initial_url: str = ""):
             elif path == "/select":
                 i = int(self._body().get("index", 0))
                 if 0 <= i < len(state.candidates):
-                    _gui_start_download(state, state.candidates[i])
+                    _gui_start_job(state, state.candidates[i])
                 self._json(200, {"ok": True})
             elif path == "/stop":
-                state.stop_event.set()
+                jid = self._body().get("id")
+                job = state.jobs.get(jid)
+                if job:
+                    job.stop_event.set()
                 self._json(200, {"ok": True})
             else:
                 self._send(404, "text/plain", b"not found")

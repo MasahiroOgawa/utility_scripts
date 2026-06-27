@@ -13,6 +13,7 @@ Extraction is always done by yt-dlp; the download engine is then chosen by proto
 Features:
 
 - **Browser-based GUI** with a **Paste** button — running it starts a tiny local web server and opens the page in your browser (no desktop toolkit needed).
+- **Parallel downloads** — queue as many as you like (paste more URLs, or pick several candidates); up to 4 download at once and the rest wait, each with its own progress bar and Stop button.
 - When the main video can't be auto-detected, shows several candidates with tiny frame-grab thumbnails and lets you pick.
 - `curl_cffi` browser impersonation to get past Cloudflare 403; generic-extractor and HTML-scrape fallbacks when a site extractor refuses.
 - Resumable downloads, live percentage, and max-resolution selection.
