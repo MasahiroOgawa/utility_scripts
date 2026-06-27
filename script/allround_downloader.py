@@ -245,8 +245,53 @@ def probe(url: str, log: Callable[[str], None] = print) -> list[Candidate]:
     return [_candidate_from_info(info)]
 
 
+_PACK_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _unpack_packed_js(html: str) -> str:
+    """Decode Dean-Edwards p.a.c.k.e.r'd scripts (used by missav/njav-family
+    sites to hide the m3u8 URL). Returns the concatenated unpacked source."""
+
+    def base_n(n: int, base: int) -> str:
+        if n == 0:
+            return _PACK_DIGITS[0]
+        s = ""
+        while n:
+            s = _PACK_DIGITS[n % base] + s
+            n //= base
+        return s
+
+    out = []
+    for m in re.finditer(r"\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)", html, re.S):
+        try:
+            payload, base, count, words = (
+                m.group(1), int(m.group(2)), int(m.group(3)), m.group(4).split("|"))
+            while count:
+                count -= 1
+                if count < len(words) and words[count]:
+                    payload = re.sub(r"\b" + re.escape(base_n(count, base)) + r"\b",
+                                     words[count], payload)
+            out.append(payload)
+        except Exception:
+            continue
+    return "\n".join(out)
+
+
+def _page_title(html: str) -> Optional[str]:
+    m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html, re.I)
+    if not m:
+        m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+    if not m:
+        return None
+    title = re.sub(r"\s+", " ", m.group(1)).strip()
+    # drop a trailing " - SiteName" / " | SiteName" suffix (separator must be
+    # space-padded, so codes like "DASS-992" are left intact)
+    return re.split(r"\s+[|\-–]\s+", title)[0].strip() or title
+
+
 def _scrape_candidates(url: str, log: Callable[[str], None]) -> list[Candidate]:
-    """Last-resort: pull .m3u8 / .mp4 URLs straight out of the page HTML."""
+    """Last-resort: pull .m3u8 / .mp4 URLs out of the page HTML, including ones
+    hidden inside packed/obfuscated JS (missav/njav embed them that way)."""
     headers = {"User-Agent": USER_AGENT, "Referer": url}
     try:
         html = make_session().get(url, headers=headers, timeout=30).text
@@ -254,24 +299,33 @@ def _scrape_candidates(url: str, log: Callable[[str], None]) -> list[Candidate]:
         log(f"Could not fetch page: {exc}")
         return []
 
+    # search the raw HTML *and* any unpacked JS for media URLs
+    text = html + "\n" + _unpack_packed_js(html)
     found: list[str] = []
-    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:m3u8|mp4)[^\s"\'<>\\]*', html):
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:m3u8|mp4)[^\s"\'<>\\]*', text):
         u = m.group(0)
         if u not in found:
             found.append(u)
     # also catch escaped JSON urls like https:\/\/...
-    for m in re.finditer(r'https?:\\?/\\?/[^\s"\'<>]+?\.(?:m3u8|mp4)', html):
+    for m in re.finditer(r'https?:\\?/\\?/[^\s"\'<>]+?\.(?:m3u8|mp4)', text):
         u = m.group(0).replace("\\/", "/")
         if u not in found:
             found.append(u)
 
+    # If a master HLS playlist is present, prefer it: it auto-selects the best
+    # resolution, so we drop the per-resolution variants and preview clips.
+    masters = [u for u in found if re.search(r"/playlist\.m3u8", u)]
+    if masters:
+        found = masters
+
     log(f"Scraped {len(found)} media URL(s) from page.")
+    page_title = _page_title(html)
     cands = []
     for u in found:
         ext = "m3u8" if ".m3u8" in u else "mp4"
         cands.append(
             Candidate(
-                title=os.path.basename(urlparse(u).path) or ext,
+                title=page_title or os.path.basename(urlparse(u).path) or ext,
                 download_url=u,
                 is_ytdlp=False,
                 resolution="HLS" if ext == "m3u8" else "mp4",
