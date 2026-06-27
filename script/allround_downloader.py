@@ -498,10 +498,22 @@ def _download_ytdlp(cand: Candidate, outdir: str, prog: Progress) -> str:
 
 
 # ---- custom resumable HLS engine ------------------------------------------ #
-def _http_get(session: requests.Session, url: str, headers: dict, **kw) -> requests.Response:
-    r = session.get(url, headers=headers, timeout=60, **kw)
-    r.raise_for_status()
-    return r
+def _http_get(session: requests.Session, url: str, headers: dict,
+              retries: int = 5, timeout: int = 120, stop=None, **kw) -> requests.Response:
+    """GET with retries + backoff so a slow/flaky CDN segment doesn't kill the job."""
+    last = None
+    for attempt in range(retries):
+        if stop is not None and stop.is_set():
+            raise StopDownload()
+        try:
+            r = session.get(url, headers=headers, timeout=timeout, **kw)
+            r.raise_for_status()
+            return r
+        except Exception as exc:
+            last = exc
+            if attempt < retries - 1:
+                time.sleep(min(2 ** attempt, 10))
+    raise last
 
 
 def _parse_m3u8(text: str, base: str) -> tuple[list[str], list[dict]]:
@@ -577,7 +589,7 @@ def _download_hls(m3u8_url: str, headers: dict, title: str, outdir: str, prog: P
         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
             completed += 1
         else:
-            data = _fetch_segment(session, seg_url, headers, key, i, key_cache)
+            data = _fetch_segment(session, seg_url, headers, key, i, key_cache, prog.stop)
             tmp = seg_path + ".part"
             with open(tmp, "wb") as f:        # streamed write, never the whole file in RAM
                 f.write(data)
@@ -597,12 +609,12 @@ def _download_hls(m3u8_url: str, headers: dict, title: str, outdir: str, prog: P
     return out_path
 
 
-def _fetch_segment(session, url, headers, key, index, key_cache) -> bytes:
-    data = _http_get(session, url, headers).content
+def _fetch_segment(session, url, headers, key, index, key_cache, stop=None) -> bytes:
+    data = _http_get(session, url, headers, stop=stop).content
     if key:
         kbytes = key_cache.get(key["uri"])
         if kbytes is None:
-            kbytes = _http_get(session, key["uri"], headers).content
+            kbytes = _http_get(session, key["uri"], headers, stop=stop).content
             key_cache[key["uri"]] = kbytes
         iv = key["iv"] or index.to_bytes(16, "big")
         cipher = Cipher(algorithms.AES(kbytes), modes.CBC(iv))
@@ -683,13 +695,10 @@ class GuiState:
             self.logs.append(msg)
 
 
-def _gui_start_job(state: GuiState, cand: Candidate) -> Job:
-    with state.lock:
-        jid = state.next_id
-        state.next_id += 1
-        job = Job(jid, cand)
-        state.jobs[jid] = job
-        state.order.append(jid)
+def _run_job(state: GuiState, job: Job):
+    """(Re)start a job's download on its own thread. Re-runnable: a download that
+    stopped or errored resumes from disk (HLS skips cached segments; yt-dlp
+    continues the partial file)."""
 
     def on_progress(pct, status):
         job.progress = pct
@@ -707,18 +716,37 @@ def _gui_start_job(state: GuiState, cand: Candidate) -> Job:
                 job.phase, job.status = "stopped", "stopped"
                 return
             job.phase, job.status = "downloading", "starting…"
+            job.error = None
             prog = Progress(on_progress, jlog, job.stop_event)
-            job.final_path = download(cand, state.outdir or DEFAULT_OUTDIR, prog)
+            job.final_path = download(job.cand, state.outdir or DEFAULT_OUTDIR, prog)
             job.progress, job.phase, job.status = 100.0, "done", "finished ✓"
         except StopDownload:
-            job.phase, job.status = "stopped", "stopped — start it again to resume"
+            job.phase, job.status = "stopped", "stopped — Resume to continue"
         except Exception as exc:
             job.error, job.phase, job.status = str(exc), "error", f"error: {exc}"
         finally:
             state.sem.release()
 
     threading.Thread(target=work, daemon=True).start()
+
+
+def _gui_start_job(state: GuiState, cand: Candidate) -> Job:
+    with state.lock:
+        jid = state.next_id
+        state.next_id += 1
+        job = Job(jid, cand)
+        state.jobs[jid] = job
+        state.order.append(jid)
+    _run_job(state, job)
     return job
+
+
+def _gui_resume_job(state: GuiState, jid: int):
+    """Re-run a stopped/errored/finished job; resumes from whatever is on disk."""
+    job = state.jobs.get(jid)
+    if job and job.phase in ("stopped", "error", "done"):
+        job.stop_event.clear()
+        _run_job(state, job)
 
 
 def _gui_start_probe(state: GuiState, url: str):
@@ -801,6 +829,8 @@ async function pick(i){ await fetch(q('/select'),{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}); }
 async function stop(id){ await fetch(q('/stop'),{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
+async function resume(id){ await fetch(q('/resume'),{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
 let shownChoose=false;
 function renderCands(cands){
   if(shownChoose) return; shownChoose=true;
@@ -828,6 +858,9 @@ function renderJobs(jobs){
     if(j.phase==='queued'||j.phase==='downloading'){
       const b=document.createElement('button'); b.className='sec'; b.textContent='Stop';
       b.onclick=()=>stop(j.id); top.appendChild(b);
+    } else if(j.phase==='stopped'||j.phase==='error'){
+      const b=document.createElement('button'); b.textContent='Resume';
+      b.onclick=()=>resume(j.id); top.appendChild(b);
     }
     const bar=document.createElement('div'); bar.className='bar';
     const fill=document.createElement('div'); fill.className='fill '+j.phase;
@@ -957,6 +990,9 @@ def run_gui(initial_url: str = ""):
                 job = state.jobs.get(jid)
                 if job:
                     job.stop_event.set()
+                self._json(200, {"ok": True})
+            elif path == "/resume":
+                _gui_resume_job(state, self._body().get("id"))
                 self._json(200, {"ok": True})
             else:
                 self._send(404, "text/plain", b"not found")
