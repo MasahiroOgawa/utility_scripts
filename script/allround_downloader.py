@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -50,7 +51,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 import yt_dlp
@@ -711,15 +712,17 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <pre id="log"></pre>
 <script>
 const $=id=>document.getElementById(id);
+const T='__TOKEN__';
+const q=p=>p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
 async function paste(){ try{ $('url').value=(await navigator.clipboard.readText()).trim(); }catch(e){} }
 async function start(){
   const url=$('url').value.trim(); if(!url) return;
   $('cands').innerHTML='';
-  await fetch('/probe',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch(q('/probe'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({url, outdir:$('outdir').value.trim()})});
 }
-async function stop(){ await fetch('/stop',{method:'POST'}); }
-async function pick(i){ $('cands').innerHTML=''; await fetch('/select',{method:'POST',
+async function stop(){ await fetch(q('/stop'),{method:'POST'}); }
+async function pick(i){ $('cands').innerHTML=''; await fetch(q('/select'),{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}); }
 let shownChoose=false;
 function renderCands(cands){
@@ -729,7 +732,7 @@ function renderCands(cands){
   cands.forEach(c=>{
     const d=document.createElement('div'); d.className='cand';
     const img=document.createElement('img'); img.loading='lazy';
-    img.src='/thumb?index='+encodeURIComponent(c.index);
+    img.src=q('/thumb?index='+encodeURIComponent(c.index));
     const lbl=document.createElement('div'); lbl.className='lbl'; lbl.textContent=c.label;
     const btn=document.createElement('button'); btn.textContent='Download';
     btn.onclick=()=>pick(c.index);
@@ -738,7 +741,7 @@ function renderCands(cands){
 }
 async function poll(){
   try{
-    const s=await (await fetch('/status')).json();
+    const s=await (await fetch(q('/status'))).json();
     $('fill').style.width=s.progress.toFixed(1)+'%';
     $('pct').textContent=s.progress.toFixed(1)+'%  '+s.status;
     $('log').textContent=s.logs; $('log').scrollTop=$('log').scrollHeight;
@@ -754,11 +757,18 @@ poll();
 
 def run_gui(initial_url: str = ""):
     state = GuiState()
+    # Per-process secret. The control server can start downloads and fetch
+    # arbitrary URLs, so it must not be reachable by other pages/processes that
+    # merely know the port. Every request must carry this token, and the Host
+    # header must be loopback (defeats DNS-rebinding, where the browser sends an
+    # attacker-controlled Host).
+    token = secrets.token_urlsafe(32)
 
     def html() -> bytes:
         page = (_GUI_HTML
                 .replace("__INITIAL_URL__", (initial_url or "").replace('"', "&quot;"))
-                .replace("__OUTDIR__", DEFAULT_OUTDIR.replace('"', "&quot;")))
+                .replace("__OUTDIR__", DEFAULT_OUTDIR.replace('"', "&quot;"))
+                .replace("__TOKEN__", token))
         return page.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
@@ -779,10 +789,21 @@ def run_gui(initial_url: str = ""):
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+        def _authorized(self, qs: dict) -> bool:
+            host = self.headers.get("Host", "").rsplit(":", 1)[0]
+            if host not in ("127.0.0.1", "localhost"):
+                return False
+            return secrets.compare_digest(qs.get("t", [""])[0], token)
+
         def do_GET(self):
-            if self.path == "/" or self.path.startswith("/index"):
+            parsed = urlparse(self.path)
+            path, qs = parsed.path, parse_qs(parsed.query)
+            if not self._authorized(qs):
+                self._send(403, "text/plain", b"forbidden")
+                return
+            if path == "/" or path.startswith("/index"):
                 self._send(200, "text/html; charset=utf-8", html())
-            elif self.path == "/status":
+            elif path == "/status":
                 with state.lock:
                     self._json(200, {
                         "phase": state.phase,
@@ -794,42 +815,44 @@ def run_gui(initial_url: str = ""):
                         "final_path": state.final_path,
                         "error": state.error,
                     })
-            elif self.path.startswith("/thumb"):
+            elif path == "/thumb":
                 try:
-                    i = int(self.path.split("index=")[1])
+                    i = int(qs.get("index", ["x"])[0])
                     if i not in state.thumbs:
                         state.thumbs[i] = make_thumbnail(state.candidates[i])
                     png = state.thumbs.get(i)
                 except Exception:
                     png = None
-                if png:
-                    self._send(200, "image/png", png)
-                else:
-                    self._send(204, "image/png", b"")
+                self._send(200, "image/png", png) if png else self._send(204, "image/png", b"")
             else:
                 self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
-            if self.path == "/probe":
+            parsed = urlparse(self.path)
+            path, qs = parsed.path, parse_qs(parsed.query)
+            if not self._authorized(qs):
+                self._send(403, "text/plain", b"forbidden")
+                return
+            if path == "/probe":
                 b = self._body()
                 state.outdir = (b.get("outdir") or DEFAULT_OUTDIR).strip()
                 url = (b.get("url") or "").strip()
                 if url:
                     _gui_start_probe(state, url)
                 self._json(200, {"ok": True})
-            elif self.path == "/select":
+            elif path == "/select":
                 i = int(self._body().get("index", 0))
                 if 0 <= i < len(state.candidates):
                     _gui_start_download(state, state.candidates[i])
                 self._json(200, {"ok": True})
-            elif self.path == "/stop":
+            elif path == "/stop":
                 state.stop_event.set()
                 self._json(200, {"ok": True})
             else:
                 self._send(404, "text/plain", b"not found")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/?t={token}"
     print(f"Allround Downloader UI: {url}", flush=True)
     print("(leave this running; press Ctrl+C to quit)", flush=True)
     try:
