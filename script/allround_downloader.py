@@ -571,12 +571,23 @@ def _download_hls(m3u8_url: str, headers: dict, title: str, outdir: str, prog: P
         raise RuntimeError("No segments found in HLS playlist.")
 
     total = len(segments)
-    prog.on_log(f"{total} segments. Downloading (resumable)…")
 
-    # per-URL work dir so a restart finds the already-fetched .ts files
-    work = os.path.join(outdir, ".cache_" + hashlib.md5(m3u8_url.encode()).hexdigest()[:12])
+    # Per-video work dir so a restart finds the already-fetched .ts files.
+    # Key on host+path only (NOT the query): signed-token query strings expire
+    # and change every run, which would otherwise orphan the cache and restart
+    # from 0%. Segments are stored by index, so a fresh token still resumes.
+    parts = urlparse(m3u8_url)
+    cache_key = hashlib.md5(f"{parts.netloc}{parts.path}".encode()).hexdigest()[:12]
+    work = os.path.join(outdir, ".cache_" + cache_key)
     os.makedirs(work, exist_ok=True)
     key_cache: dict[str, bytes] = {}
+
+    already = sum(1 for i in range(total)
+                  if os.path.exists(os.path.join(work, f"seg_{i:06d}.ts"))
+                  and os.path.getsize(os.path.join(work, f"seg_{i:06d}.ts")) > 0)
+    if already:
+        prog.on_log(f"Resuming: {already}/{total} segments already cached.")
+    prog.on_log(f"{total} segments. Downloading (resumable)…")
 
     completed = 0
     last_ui = 0.0
