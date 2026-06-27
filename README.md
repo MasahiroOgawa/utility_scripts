@@ -1,6 +1,41 @@
 # utility_scripts
 This is a collection of utility shell scripts.
 
+## `allround_downloader.py` — paste-the-URL video downloader
+
+Downloads the main video from almost any site (YouTube, missav, jable, njav, and generic pages) as a clean `.mp4`. The only required input is a copied URL.
+
+Extraction is always done by yt-dlp; the download engine is then chosen by protocol:
+
+- **HLS (m3u8)** — a custom resumable segment downloader: each `.ts` is written to disk and skipped on restart (perfect resume), AES-128 is decrypted, and segments are streamed into a single file then muxed to mp4 with `ffmpeg -c copy` (no failure on large >2 GB outputs).
+- **everything else** (YouTube DASH/progressive) — yt-dlp itself, resuming via byte ranges and merging `bestvideo+bestaudio` into mp4.
+
+Features:
+
+- Simple tkinter GUI with a **Paste** button.
+- When the main video can't be auto-detected, shows several candidates with tiny frame-grab thumbnails and lets you pick.
+- `curl_cffi` browser impersonation to get past Cloudflare 403; generic-extractor and HTML-scrape fallbacks when a site extractor refuses.
+- Resumable downloads, live percentage, and max-resolution selection.
+
+Prereqs (one-time): `ffmpeg` on `PATH`; Python deps are declared in `pyproject.toml` and installed by `uv`.
+
+```bash
+sudo apt install -y ffmpeg   # if not already installed
+uv sync
+```
+
+Run:
+
+```bash
+uv run allround_downloader.py                      # GUI
+uv run allround_downloader.py <URL>                # GUI pre-filled with URL
+uv run allround_downloader.py --cli <URL> -o DIR   # headless download
+uv run allround_downloader.py --probe <URL>        # just list detected candidates
+uv run allround_downloader.py --cli <URL> --pick N # download candidate index N
+```
+
+Downloads default to `./downloads/` (git-ignored). Stop any time — re-running the same URL resumes from where it left off.
+
 ## iPhone ↔ Ubuntu file transfer
 
 Two complementary scripts under `script/`. Both write files into `/home/mas/iphone-share/` — create the directory (or edit `DEST_DIR` / `SHARE_DIR` in the scripts) before first use.
