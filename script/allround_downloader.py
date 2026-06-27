@@ -814,7 +814,6 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <h1>Allround Downloader</h1>
 <div class="row">
  <input id="url" type="text" placeholder="Paste a video URL" value="__INITIAL_URL__">
- <button class="sec" onclick="paste()">Paste</button>
 </div>
 <div class="row">
  <input id="outdir" type="text" value="__OUTDIR__">
@@ -830,9 +829,9 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 const T='__TOKEN__';
 const q=p=>p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
-async function paste(){ try{ $('url').value=(await navigator.clipboard.readText()).trim(); }catch(e){} }
 async function start(){
   const url=$('url').value.trim(); if(!url) return;
+  $('url').value='';
   await fetch(q('/probe'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({url, outdir:$('outdir').value.trim()})});
 }
