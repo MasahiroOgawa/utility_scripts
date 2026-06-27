@@ -1,7 +1,7 @@
 # utility_scripts
 This is a collection of utility shell scripts.
 
-## `allround_downloader.py` — paste-the-URL video downloader
+## `script/allround_downloader.py` — paste-the-URL video downloader
 
 Downloads the main video from almost any site (YouTube, missav, jable, njav, and generic pages) as a clean `.mp4`. The only required input is a copied URL.
 
@@ -27,11 +27,11 @@ uv sync
 Run:
 
 ```bash
-uv run allround_downloader.py                      # GUI
-uv run allround_downloader.py <URL>                # GUI pre-filled with URL
-uv run allround_downloader.py --cli <URL> -o DIR   # headless download
-uv run allround_downloader.py --probe <URL>        # just list detected candidates
-uv run allround_downloader.py --cli <URL> --pick N # download candidate index N
+uv run script/allround_downloader.py                      # GUI
+uv run script/allround_downloader.py <URL>                # GUI pre-filled with URL
+uv run script/allround_downloader.py --cli <URL> -o DIR   # headless download
+uv run script/allround_downloader.py --probe <URL>        # just list detected candidates
+uv run script/allround_downloader.py --cli <URL> --pick N # download candidate index N
 ```
 
 Downloads default to `./downloads/` (git-ignored). Stop any time — re-running the same URL resumes from where it left off.
