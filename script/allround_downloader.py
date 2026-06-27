@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -45,8 +46,9 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass, field
-from queue import Empty, Queue
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -583,193 +585,262 @@ def _mux_segments(work: str, total: int, out_path: str, prog: Progress):
 
 
 # --------------------------------------------------------------------------- #
-# GUI
+# GUI — browser-based, so it needs no native toolkit and runs anywhere on the
+# uv-managed Python with just `uv sync` (the engine logic above is reused as-is).
 # --------------------------------------------------------------------------- #
+class GuiState:
+    """Shared server-side state for the browser UI, mutated by worker threads."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.candidates: list[Candidate] = []
+        self.thumbs: dict[int, Optional[bytes]] = {}
+        self.outdir = DEFAULT_OUTDIR
+        self.phase = "idle"   # idle|probing|choose|downloading|done|stopped|error
+        self.progress = 0.0
+        self.status = "idle"
+        self.logs: list[str] = []
+        self.final_path: Optional[str] = None
+        self.error: Optional[str] = None
+
+    def log(self, msg: str):
+        with self.lock:
+            self.logs.append(msg)
+
+    def reset(self):
+        self.stop_event.clear()
+        self.candidates = []
+        self.thumbs = {}
+        self.phase = "idle"
+        self.progress = 0.0
+        self.status = ""
+        self.logs = []
+        self.final_path = None
+        self.error = None
+
+
+def _gui_start_download(state: GuiState, cand: Candidate):
+    state.stop_event.clear()
+    state.phase = "downloading"
+    state.progress = 0.0
+    state.status = "starting…"
+
+    def on_progress(pct, status):
+        state.progress = pct
+        state.status = status
+
+    prog = Progress(on_progress, state.log, state.stop_event)
+
+    def work():
+        try:
+            path = download(cand, state.outdir or DEFAULT_OUTDIR, prog)
+            state.final_path = path
+            state.status = "finished ✓"
+            state.phase = "done"
+        except StopDownload:
+            state.status = "stopped — click Download again to resume"
+            state.phase = "stopped"
+        except Exception as exc:
+            state.error = str(exc)
+            state.status = "error"
+            state.phase = "error"
+
+    state.thread = threading.Thread(target=work, daemon=True)
+    state.thread.start()
+
+
+def _gui_start_probe(state: GuiState, url: str):
+    state.reset()
+    state.phase = "probing"
+    state.status = "probing…"
+    state.log(f"Probing {url}")
+
+    def work():
+        try:
+            cands = probe(url, state.log)
+            state.candidates = cands
+            if not cands:
+                state.error = "No downloadable media found."
+                state.phase = "error"
+            elif len(cands) == 1:
+                state.log(f"Found: {cands[0].label}")
+                _gui_start_download(state, cands[0])
+            else:
+                state.log(f"{len(cands)} candidates found — choose one.")
+                state.phase = "choose"
+        except Exception as exc:
+            state.error = str(exc)
+            state.phase = "error"
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+_GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>Allround Downloader</title>
+<style>
+ body{font-family:system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;color:#111}
+ h1{font-size:20px} .row{display:flex;gap:8px;margin:8px 0}
+ input[type=text]{flex:1;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+ button{padding:8px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
+ button.sec{background:#e5e7eb;color:#111} button:disabled{opacity:.5;cursor:default}
+ #bar{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden;margin:6px 0}
+ #fill{height:100%;width:0;background:#2563eb;transition:width .2s}
+ #pct{font-size:13px;color:#374151;min-height:18px}
+ pre#log{background:#0b1020;color:#cbd5e1;padding:10px;border-radius:6px;height:220px;overflow:auto;font-size:12px;white-space:pre-wrap}
+ .cand{display:flex;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:8px;padding:8px;margin:6px 0}
+ .cand img{width:120px;height:68px;object-fit:cover;background:#e5e7eb;border-radius:4px}
+ .cand .lbl{flex:1;font-size:13px} #cands{margin:10px 0}
+</style></head><body>
+<h1>Allround Downloader</h1>
+<div class="row">
+ <input id="url" type="text" placeholder="Paste a video URL" value="__INITIAL_URL__">
+ <button class="sec" onclick="paste()">Paste</button>
+</div>
+<div class="row">
+ <input id="outdir" type="text" value="__OUTDIR__">
+</div>
+<div class="row">
+ <button id="dl" onclick="start()">Download</button>
+ <button id="stop" class="sec" onclick="stop()" disabled>Stop</button>
+</div>
+<div id="bar"><div id="fill"></div></div>
+<div id="pct">idle</div>
+<div id="cands"></div>
+<pre id="log"></pre>
+<script>
+const $=id=>document.getElementById(id);
+async function paste(){ try{ $('url').value=(await navigator.clipboard.readText()).trim(); }catch(e){} }
+async function start(){
+  const url=$('url').value.trim(); if(!url) return;
+  $('cands').innerHTML='';
+  await fetch('/probe',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url, outdir:$('outdir').value.trim()})});
+}
+async function stop(){ await fetch('/stop',{method:'POST'}); }
+async function pick(i){ $('cands').innerHTML=''; await fetch('/select',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}); }
+let shownChoose=false;
+function renderCands(cands){
+  if(shownChoose) return; shownChoose=true;
+  const box=$('cands'); box.textContent='';
+  const h=document.createElement('b'); h.textContent='Choose the video to download:'; box.appendChild(h);
+  cands.forEach(c=>{
+    const d=document.createElement('div'); d.className='cand';
+    const img=document.createElement('img'); img.loading='lazy';
+    img.src='/thumb?index='+encodeURIComponent(c.index);
+    const lbl=document.createElement('div'); lbl.className='lbl'; lbl.textContent=c.label;
+    const btn=document.createElement('button'); btn.textContent='Download';
+    btn.onclick=()=>pick(c.index);
+    d.append(img,lbl,btn); box.appendChild(d);
+  });
+}
+async function poll(){
+  try{
+    const s=await (await fetch('/status')).json();
+    $('fill').style.width=s.progress.toFixed(1)+'%';
+    $('pct').textContent=s.progress.toFixed(1)+'%  '+s.status;
+    $('log').textContent=s.logs; $('log').scrollTop=$('log').scrollHeight;
+    $('dl').disabled=(s.phase==='probing'||s.phase==='downloading');
+    $('stop').disabled=(s.phase!=='downloading');
+    if(s.phase==='choose') renderCands(s.candidates); else if(s.phase!=='choose') shownChoose=false;
+  }catch(e){}
+  setTimeout(poll,400);
+}
+poll();
+</script></body></html>"""
+
+
 def run_gui(initial_url: str = ""):
-    import tkinter as tk
-    from tkinter import filedialog, ttk
+    state = GuiState()
 
-    root = tk.Tk()
-    root.title("Allround Downloader")
-    root.geometry("720x560")
+    def html() -> bytes:
+        page = (_GUI_HTML
+                .replace("__INITIAL_URL__", (initial_url or "").replace('"', "&quot;"))
+                .replace("__OUTDIR__", DEFAULT_OUTDIR.replace('"', "&quot;")))
+        return page.encode("utf-8")
 
-    msgq: Queue = Queue()
-    stop_event = threading.Event()
-    state = {"thread": None, "outdir": DEFAULT_OUTDIR, "thumb_refs": []}
-
-    # --- layout ---
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
-    ttk.Label(top, text="Video URL:").pack(side="left")
-    url_var = tk.StringVar(value=initial_url)
-    url_entry = ttk.Entry(top, textvariable=url_var)
-    url_entry.pack(side="left", fill="x", expand=True, padx=6)
-
-    def paste():
-        try:
-            url_var.set(root.clipboard_get().strip())
-        except tk.TclError:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence the default request logging
             pass
 
-    ttk.Button(top, text="Paste", command=paste).pack(side="left")
+        def _send(self, code, ctype, body: bytes):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    row2 = ttk.Frame(root, padding=(10, 0))
-    row2.pack(fill="x")
-    outdir_var = tk.StringVar(value=DEFAULT_OUTDIR)
-    ttk.Label(row2, text="Save to:").pack(side="left")
-    ttk.Entry(row2, textvariable=outdir_var).pack(side="left", fill="x", expand=True, padx=6)
+        def _json(self, code, obj):
+            self._send(code, "application/json", json.dumps(obj).encode("utf-8"))
 
-    def choose_dir():
-        d = filedialog.askdirectory(initialdir=outdir_var.get() or ".")
-        if d:
-            outdir_var.set(d)
+        def _body(self) -> dict:
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
-    ttk.Button(row2, text="Browse", command=choose_dir).pack(side="left")
-
-    ctrl = ttk.Frame(root, padding=10)
-    ctrl.pack(fill="x")
-    dl_btn = ttk.Button(ctrl, text="Download")
-    dl_btn.pack(side="left")
-    stop_btn = ttk.Button(ctrl, text="Stop", state="disabled")
-    stop_btn.pack(side="left", padx=6)
-
-    pbar = ttk.Progressbar(root, maximum=100)
-    pbar.pack(fill="x", padx=10, pady=(0, 4))
-    pct_var = tk.StringVar(value="idle")
-    ttk.Label(root, textvariable=pct_var).pack(anchor="w", padx=10)
-
-    log_box = tk.Text(root, height=16, wrap="word")
-    log_box.pack(fill="both", expand=True, padx=10, pady=10)
-
-    def gui_log(msg: str):
-        msgq.put(("log", msg))
-
-    def gui_progress(pct: float, status: str):
-        msgq.put(("progress", pct, status))
-
-    # --- worker plumbing ---
-    def start_download(cand: Candidate):
-        stop_event.clear()
-        prog = Progress(gui_progress, gui_log, stop_event)
-
-        def work():
-            try:
-                download(cand, outdir_var.get() or DEFAULT_OUTDIR, prog)
-                msgq.put(("done", None))
-            except StopDownload:
-                msgq.put(("stopped", None))
-            except Exception as exc:
-                msgq.put(("error", str(exc)))
-
-        dl_btn.config(state="disabled")
-        stop_btn.config(state="normal")
-        state["thread"] = threading.Thread(target=work, daemon=True)
-        state["thread"].start()
-
-    def probe_and_go():
-        url = url_var.get().strip()
-        if not url:
-            return
-        dl_btn.config(state="disabled")
-        pct_var.set("probing…")
-        gui_log(f"Probing {url}")
-
-        def work():
-            try:
-                cands = probe(url, gui_log)
-                msgq.put(("candidates", cands))
-            except Exception as exc:
-                msgq.put(("error", str(exc)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def show_picker(cands: list[Candidate]):
-        win = tk.Toplevel(root)
-        win.title("Choose the video to download")
-        win.geometry("560x520")
-        ttk.Label(win, text="Couldn't auto-pick one main video. Choose below:",
-                  padding=8).pack(anchor="w")
-        canvas = tk.Canvas(win)
-        scroll = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        frame = ttk.Frame(canvas)
-        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=frame, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        def pick(c):
-            win.destroy()
-            start_download(c)
-
-        for c in cands:
-            rowf = ttk.Frame(frame, padding=4)
-            rowf.pack(fill="x", expand=True)
-            lbl = ttk.Label(rowf, text="…")
-            lbl.pack(side="left")
-            btn = ttk.Button(rowf, text=c.label, command=lambda cc=c: pick(cc))
-            btn.pack(side="left", fill="x", expand=True, padx=6)
-
-            # fetch a tiny thumbnail in the background
-            def load_thumb(cc=c, target=lbl):
-                png = make_thumbnail(cc)
+        def do_GET(self):
+            if self.path == "/" or self.path.startswith("/index"):
+                self._send(200, "text/html; charset=utf-8", html())
+            elif self.path == "/status":
+                with state.lock:
+                    self._json(200, {
+                        "phase": state.phase,
+                        "progress": state.progress,
+                        "status": state.status,
+                        "logs": "\n".join(state.logs[-300:]),
+                        "candidates": [{"index": i, "label": c.label}
+                                       for i, c in enumerate(state.candidates)],
+                        "final_path": state.final_path,
+                        "error": state.error,
+                    })
+            elif self.path.startswith("/thumb"):
+                try:
+                    i = int(self.path.split("index=")[1])
+                    if i not in state.thumbs:
+                        state.thumbs[i] = make_thumbnail(state.candidates[i])
+                    png = state.thumbs.get(i)
+                except Exception:
+                    png = None
                 if png:
-                    msgq.put(("thumb", target, png))
+                    self._send(200, "image/png", png)
+                else:
+                    self._send(204, "image/png", b"")
+            else:
+                self._send(404, "text/plain", b"not found")
 
-            threading.Thread(target=load_thumb, daemon=True).start()
+        def do_POST(self):
+            if self.path == "/probe":
+                b = self._body()
+                state.outdir = (b.get("outdir") or DEFAULT_OUTDIR).strip()
+                url = (b.get("url") or "").strip()
+                if url:
+                    _gui_start_probe(state, url)
+                self._json(200, {"ok": True})
+            elif self.path == "/select":
+                i = int(self._body().get("index", 0))
+                if 0 <= i < len(state.candidates):
+                    _gui_start_download(state, state.candidates[i])
+                self._json(200, {"ok": True})
+            elif self.path == "/stop":
+                state.stop_event.set()
+                self._json(200, {"ok": True})
+            else:
+                self._send(404, "text/plain", b"not found")
 
-    dl_btn.config(command=probe_and_go)
-    stop_btn.config(command=lambda: stop_event.set())
-
-    # --- message pump ---
-    def pump():
-        try:
-            while True:
-                msg = msgq.get_nowait()
-                kind = msg[0]
-                if kind == "log":
-                    log_box.insert("end", msg[1] + "\n")
-                    log_box.see("end")
-                elif kind == "progress":
-                    pbar["value"] = msg[1]
-                    pct_var.set(f"{msg[1]:.1f}%   {msg[2]}")
-                elif kind == "candidates":
-                    cands = msg[1]
-                    if not cands:
-                        pct_var.set("nothing found")
-                        log_box.insert("end", "No downloadable media found.\n")
-                        dl_btn.config(state="normal")
-                    elif len(cands) == 1:
-                        log_box.insert("end", f"Found: {cands[0].label}\n")
-                        start_download(cands[0])
-                    else:
-                        log_box.insert("end", f"{len(cands)} candidates found.\n")
-                        dl_btn.config(state="normal")
-                        show_picker(cands)
-                elif kind == "thumb":
-                    import base64
-                    import tkinter as _tk
-                    img = _tk.PhotoImage(data=base64.b64encode(msg[2]).decode())
-                    state["thumb_refs"].append(img)  # keep a ref alive
-                    msg[1].config(image=img)
-                elif kind in ("done", "stopped", "error"):
-                    dl_btn.config(state="normal")
-                    stop_btn.config(state="disabled")
-                    if kind == "done":
-                        pct_var.set("finished ✓")
-                        log_box.insert("end", "Download finished.\n")
-                    elif kind == "stopped":
-                        pct_var.set("stopped — restart to resume")
-                    else:
-                        pct_var.set("error")
-                        log_box.insert("end", f"ERROR: {msg[1]}\n")
-                    log_box.see("end")
-        except Empty:
-            pass
-        root.after(100, pump)
-
-    root.after(100, pump)
-    root.mainloop()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    print(f"Allround Downloader UI: {url}", flush=True)
+    print("(leave this running; press Ctrl+C to quit)", flush=True)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        httpd.shutdown()
 
 
 # --------------------------------------------------------------------------- #

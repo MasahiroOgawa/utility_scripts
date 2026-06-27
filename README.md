@@ -12,15 +12,15 @@ Extraction is always done by yt-dlp; the download engine is then chosen by proto
 
 Features:
 
-- Simple tkinter GUI with a **Paste** button.
+- **Browser-based GUI** with a **Paste** button — running it starts a tiny local web server and opens the page in your browser (no desktop toolkit needed).
 - When the main video can't be auto-detected, shows several candidates with tiny frame-grab thumbnails and lets you pick.
 - `curl_cffi` browser impersonation to get past Cloudflare 403; generic-extractor and HTML-scrape fallbacks when a site extractor refuses.
 - Resumable downloads, live percentage, and max-resolution selection.
 
-Prereqs (one-time): `ffmpeg` on `PATH`; Python deps are declared in `pyproject.toml` and installed by `uv`.
+Prereqs (one-time): `ffmpeg` on `PATH`, plus `uv sync`. All Python deps (and the Python interpreter itself) are managed by `uv` — nothing relies on the system Python, so the script runs anywhere `uv` is installed.
 
 ```bash
-sudo apt install -y ffmpeg   # if not already installed
+sudo apt install -y ffmpeg   # or your OS's package manager
 uv sync
 ```
 
