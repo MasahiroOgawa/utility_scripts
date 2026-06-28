@@ -25,7 +25,9 @@ Engine strategy
     - everything  -> yt-dlp itself (DASH/progressive resume via byte ranges, merges
       else            bestvideo+bestaudio to mp4).
   If yt-dlp can't extract at all, the page HTML is scraped for .m3u8/.mp4 URLs and
-  those become candidates.
+  those become candidates. As a last resort (pages that decrypt the player in JS
+  and gate the stream behind bot-detection), a private throwaway browser is driven
+  to press play and capture the real stream URL — see _browser_extract.
 
 Usage
     python allround_downloader.py                 # launch the GUI
@@ -217,11 +219,8 @@ def probe(url: str, log: Callable[[str], None] = print) -> list[Candidate]:
                 log(f"generic extractor failed ({exc2}); scraping page…")
         else:
             log(f"yt-dlp extraction failed ({exc}); scraping page for media URLs…")
-    if info is None:
-        return _scrape_candidates(url, log)
-
     if not info:
-        return _scrape_candidates(url, log)
+        return _scrape_or_browser(url, log)
 
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
@@ -333,6 +332,136 @@ def _scrape_candidates(url: str, log: Callable[[str], None]) -> list[Candidate]:
             )
         )
     return cands
+
+
+# Hosts that only ever serve ads / trackers / unrelated previews — never the
+# main video. Used to filter the URLs a real browser fetches.
+_AD_HOSTS = (
+    "pornfhd.com/files", "xlirdr", "jads.co", "google", "nettrck", "storagexhd",
+    "javhd-trk", "cloudflare", "mavrtracktor", "content-sync", "udzpel",
+    "sandwich", "doubleclick", "adsby", "creative.", "/banner", "tapioni",
+    "cyrady", "hotsoz", "tesorf", "kibibe", "doppiocdn",
+)
+
+
+def _is_ad_media(u: str) -> bool:
+    if any(a in u for a in _AD_HOSTS):
+        return True
+    # tiny banner/preview clips live under sized paths like /300x250/ or /preview
+    return bool(re.search(r"/\d{2,4}x\d{2,4}/|/preview\.mp4", u))
+
+
+def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
+    """Last resort for pages that decrypt the player client-side and gate the
+    stream behind bot-detection (e.g. javhdporn/kingtube): drive a *private,
+    throwaway* browser, press play, and capture the real .m3u8/.mp4 the player
+    requests. Leaves no trace — its profile is an auto-deleted temp dir and it
+    never touches the system's own browser/profile."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        log("Browser fallback unavailable: run `uv sync` to install playwright.")
+        return []
+
+    headed = bool(os.environ.get("DISPLAY"))
+    media: list[str] = []
+    title_holder: dict[str, str] = {}
+
+    def remember(resp):
+        try:
+            u = resp.url
+            ct = (resp.headers or {}).get("content-type", "")
+        except Exception:
+            return
+        is_media = (".m3u8" in u or ".m4s" in u or re.search(r"\.ts(\?|$)", u)
+                    or ".mp4" in u or "mpegurl" in ct or "mp2t" in ct)
+        if is_media and not _is_ad_media(u) and u not in media:
+            media.append(u)
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(
+                headless=not headed,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--autoplay-policy=no-user-gesture-required",
+                      "--mute-audio"],
+            )
+        except Exception as exc:
+            log(f"Could not launch the bundled browser ({exc}). "
+                "Run `uv run playwright install chromium` once.")
+            return []
+        try:
+            ctx = browser.new_context(user_agent=USER_AGENT)
+            # Hide the obvious automation tells before any page script runs.
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page = ctx.new_page()
+            page.on("response", remember)
+            log("Browser fallback: loading page…")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
+            try:
+                title_holder["t"] = page.title()
+            except Exception:
+                pass
+            # Trigger the player: click the page's play button, then nudge any
+            # <video> inside the (possibly cross-origin) player frames.
+            try:
+                page.evaluate(
+                    "() => { const b = document.querySelector('.play-button') ||"
+                    " document.querySelector('.responsive-player'); if (b) b.click(); }")
+            except Exception:
+                pass
+            page.wait_for_timeout(6000)
+            for fr in page.frames:
+                try:
+                    fr.evaluate(
+                        "() => { document.querySelectorAll('video').forEach("
+                        "v => { v.muted = true; v.play && v.play().catch(()=>{}); }); }")
+                except Exception:
+                    pass
+            page.wait_for_timeout(10000)
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    # Prefer a master HLS playlist; otherwise keep m3u8s, else fall back to mp4.
+    m3u8s = [u for u in media if ".m3u8" in u]
+    masters = [u for u in m3u8s if re.search(r"/(playlist|master|index)\.m3u8", u)]
+    chosen = masters or m3u8s or [u for u in media if ".mp4" in u]
+    if not chosen:
+        log("Browser fallback found no playable stream "
+            "(site may have served a decoy to automation).")
+        return []
+
+    log(f"Browser fallback captured {len(chosen)} stream URL(s).")
+    title = re.split(r"\s+[|\-–]\s+", (title_holder.get("t") or "").strip())[0] \
+        or _safe_name(os.path.basename(urlparse(url).path))
+    return [
+        Candidate(
+            title=title,
+            download_url=u,
+            is_ytdlp=False,
+            resolution="HLS" if ".m3u8" in u else "mp4",
+            http_headers={"User-Agent": USER_AGENT, "Referer": url},
+        )
+        for u in chosen
+    ]
+
+
+def _scrape_or_browser(url: str, log: Callable[[str], None]) -> list[Candidate]:
+    """Scrape the page HTML for a stream; if that finds no clear main video,
+    fall back to driving a real browser."""
+    cands = _scrape_candidates(url, log)
+    # A clear main video exposes an .m3u8, or just one media URL. Several
+    # mp4-only hits are usually unrelated previews/ads — the real player is
+    # hidden (decrypted client-side), so let a real browser reveal it.
+    if any(".m3u8" in c.download_url for c in cands) or len(cands) == 1:
+        return cands
+    log("No clear stream in page source; trying browser fallback…")
+    return _browser_extract(url, log) or cands
 
 
 # --------------------------------------------------------------------------- #
