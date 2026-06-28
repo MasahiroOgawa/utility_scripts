@@ -5,7 +5,7 @@ allround_downloader.py — a paste-the-URL video downloader for almost any site.
 Goals (see project request):
   * Works on general sites incl. YouTube, missav123.com, jable.tv, njavtv.com.
   * Downloads the *main* video. When the main one can't be auto-detected it shows
-    several candidates with tiny preview thumbnails and lets the user pick.
+    several candidates with short looping preview clips and lets the user pick.
   * Simple GUI — the only required input is a copied URL.
   * Incremental / resumable: stop any time and restart picks up where it left off,
     finally producing a clean .mp4.
@@ -377,6 +377,46 @@ def _ffmpeg_frame(src: str, headers: dict, max_w: int) -> Optional[bytes]:
         return None
 
 
+def make_preview_clip(cand: Candidate, max_w: int = 240, dur: int = 10) -> Optional[bytes]:
+    """Return a short (~*dur* s) mp4 preview from the start of *cand*, scaled to
+    *max_w* wide, or None. A clip is far easier to recognise than a single frame.
+    Costs one small ffmpeg transcode of the opening seconds."""
+    src = cand.download_url
+    if cand.is_ytdlp and cand.info:
+        fmt = _best_format(cand.info)
+        if fmt and fmt.get("url"):
+            src = fmt["url"]
+    return _ffmpeg_clip(src, cand.http_headers, max_w, dur)
+
+
+def _ffmpeg_clip(src: str, headers: dict, max_w: int, dur: int) -> Optional[bytes]:
+    import tempfile
+
+    cmd = [FFMPEG, "-y", "-loglevel", "error"]
+    if headers:
+        hdr = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        cmd += ["-headers", hdr]
+    fd, out_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    # -t after -i clips the output to the first *dur* seconds; scale to an even
+    # height (h264 needs even dims); +faststart so the browser can play at once.
+    cmd += ["-i", src, "-t", str(dur), "-vf", f"scale={max_w}:-2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", out_path]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=90)
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return data or None
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
+
 def _png_resize(data: bytes, max_w: int) -> Optional[bytes]:
     try:
         import io
@@ -695,6 +735,7 @@ class GuiState:
         self.next_id = 1
         self.candidates: list[Candidate] = []
         self.thumbs: dict[int, Optional[bytes]] = {}
+        self.previews: dict[int, Optional[bytes]] = {}
         self.outdir = DEFAULT_OUTDIR
         self.probe_phase = "idle"   # idle|probing|choose|error
         self.probe_status = "idle"
@@ -764,6 +805,7 @@ def _gui_start_probe(state: GuiState, url: str):
     with state.lock:
         state.candidates = []
         state.thumbs = {}
+        state.previews = {}
     state.probe_phase = "probing"
     state.probe_status = "probing…"
     state.probe_error = None
@@ -800,7 +842,7 @@ _GUI_HTML = """<!doctype html><html><head><meta charset="utf-8">
  button.sec{background:#e5e7eb;color:#111} button:disabled{opacity:.5;cursor:default}
  pre#log{background:#0b1020;color:#cbd5e1;padding:10px;border-radius:6px;height:180px;overflow:auto;font-size:12px;white-space:pre-wrap}
  .cand{display:flex;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:8px;padding:8px;margin:6px 0}
- .cand img{width:120px;height:68px;object-fit:cover;background:#e5e7eb;border-radius:4px}
+ .cand img,.cand video{width:160px;height:90px;object-fit:cover;background:#e5e7eb;border-radius:4px}
  .cand .lbl{flex:1;font-size:13px} #cands,#jobs{margin:10px 0}
  .job{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;margin:6px 0}
  .job .top{display:flex;gap:8px;align-items:center}
@@ -850,12 +892,17 @@ function renderCands(cands){
   box.appendChild(h);
   cands.forEach(c=>{
     const d=document.createElement('div'); d.className='cand';
-    const img=document.createElement('img'); img.loading='lazy';
-    img.src=q('/thumb?index='+encodeURIComponent(c.index));
+    const v=document.createElement('video');
+    v.src=q('/preview?index='+encodeURIComponent(c.index));
+    v.muted=true; v.loop=true; v.autoplay=true; v.playsInline=true;
+    v.controls=true; v.preload='metadata';
+    // No clip available (encode failed / 204) → fall back to a still frame.
+    v.onerror=()=>{ const img=document.createElement('img'); img.loading='lazy';
+      img.src=q('/thumb?index='+encodeURIComponent(c.index)); v.replaceWith(img); };
     const lbl=document.createElement('div'); lbl.className='lbl'; lbl.textContent=c.label;
     const btn=document.createElement('button'); btn.textContent='Download';
     btn.onclick=()=>{ pick(c.index); btn.textContent='Queued ✓'; };
-    d.append(img,lbl,btn); box.appendChild(d);
+    d.append(v,lbl,btn); box.appendChild(d);
   });
 }
 function renderJobs(jobs){
@@ -974,6 +1021,15 @@ def run_gui(initial_url: str = ""):
                 except Exception:
                     png = None
                 self._send(200, "image/png", png) if png else self._send(204, "image/png", b"")
+            elif path == "/preview":
+                try:
+                    i = int(qs.get("index", ["x"])[0])
+                    if i not in state.previews:
+                        state.previews[i] = make_preview_clip(state.candidates[i])
+                    mp4 = state.previews.get(i)
+                except Exception:
+                    mp4 = None
+                self._send(200, "video/mp4", mp4) if mp4 else self._send(204, "video/mp4", b"")
             else:
                 self._send(404, "text/plain", b"not found")
 
