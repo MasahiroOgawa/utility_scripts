@@ -21,12 +21,11 @@ Extraction is always done by yt-dlp; the download engine is then chosen by proto
 `ffmpeg` on `PATH`, plus `uv sync`. All Python deps (and the Python interpreter itself) are managed by `uv` — nothing relies on the system Python, so the script runs anywhere `uv` is installed.
 
 ```bash
-sudo apt install -y ffmpeg   # or your OS's package manager
+sudo apt install -y ffmpeg chromium   # ffmpeg always; chromium for the browser fallback
 uv sync
-uv run playwright install chromium   # one-time: only needed for the browser fallback
 ```
 
-The `playwright install chromium` step downloads Playwright's own Chromium (~150 MB) and is only required for the browser-fallback feature. Skip it if you never hit a JS-gated site; the tool will print a reminder if it's ever needed.
+The browser fallback needs a Chromium/Chrome browser. It uses a system-installed one if present (`apt install chromium`, `chromium-browser`, or Google Chrome) — so plain `uv sync` is all the Python setup you need. If you'd rather not install one system-wide, run `uv run playwright install chromium` to fetch Playwright's own (~150 MB) instead. Skip both if you never hit a JS-gated site; the tool prints a reminder if it's ever needed.
 
 ## Run
 

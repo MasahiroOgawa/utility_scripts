@@ -351,6 +351,18 @@ def _is_ad_media(u: str) -> bool:
     return bool(re.search(r"/\d{2,4}x\d{2,4}/|/preview\.mp4", u))
 
 
+def _system_chromium() -> Optional[str]:
+    """Path to a system-installed Chromium/Chrome, or None. Lets the browser
+    fallback work with an apt-installed browser (just `uv sync`), instead of
+    Playwright's separately-downloaded one."""
+    for name in ("chromium", "chromium-browser", "google-chrome",
+                 "google-chrome-stable", "chrome"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
     """Last resort for pages that decrypt the player client-side and gate the
     stream behind bot-detection (e.g. javhdporn/kingtube): drive a *private,
@@ -378,17 +390,26 @@ def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
         if is_media and not _is_ad_media(u) and u not in media:
             media.append(u)
 
+    # Prefer a system-installed Chromium (apt) so plain `uv sync` is enough;
+    # otherwise use Playwright's own browser (`uv run playwright install chromium`).
+    exe = _system_chromium()
+    launch_kwargs = {
+        "headless": not headed,
+        "args": ["--disable-blink-features=AutomationControlled",
+                 "--autoplay-policy=no-user-gesture-required",
+                 "--mute-audio",
+                 "--no-sandbox"],  # apt/snap Chromium often needs this in a VM
+    }
+    if exe:
+        launch_kwargs["executable_path"] = exe
+
     with sync_playwright() as p:
         try:
-            browser = p.chromium.launch(
-                headless=not headed,
-                args=["--disable-blink-features=AutomationControlled",
-                      "--autoplay-policy=no-user-gesture-required",
-                      "--mute-audio"],
-            )
+            browser = p.chromium.launch(**launch_kwargs)
         except Exception as exc:
-            log(f"Could not launch the bundled browser ({exc}). "
-                "Run `uv run playwright install chromium` once.")
+            log(f"Could not launch a browser ({exc}). Install Chromium with "
+                "`sudo apt install -y chromium` (then just `uv sync`), or run "
+                "`uv run playwright install chromium`.")
             return []
         try:
             ctx = browser.new_context(user_agent=USER_AGENT)
