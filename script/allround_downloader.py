@@ -702,7 +702,14 @@ def _http_get(session: requests.Session, url: str, headers: dict,
         except Exception as exc:
             last = exc
             if attempt < retries - 1:
-                time.sleep(min(2 ** attempt, 10))
+                delay = min(2 ** attempt, 10)
+                # Interruptible backoff: a Stop returns at once instead of
+                # blocking out the full delay before the next stop check.
+                if stop is not None:
+                    if stop.wait(delay):
+                        raise StopDownload()
+                else:
+                    time.sleep(delay)
     raise last
 
 
@@ -811,11 +818,13 @@ def _download_hls(m3u8_url: str, headers: dict, title: str, outdir: str, prog: P
 
 
 def _fetch_segment(session, url, headers, key, index, key_cache, stop=None) -> bytes:
-    data = _http_get(session, url, headers, stop=stop).content
+    # Shorter timeout than the playlist fetch: a hung segment should fail fast
+    # (and retry) rather than block a Stop for up to two minutes.
+    data = _http_get(session, url, headers, timeout=30, stop=stop).content
     if key:
         kbytes = key_cache.get(key["uri"])
         if kbytes is None:
-            kbytes = _http_get(session, key["uri"], headers, stop=stop).content
+            kbytes = _http_get(session, key["uri"], headers, timeout=30, stop=stop).content
             key_cache[key["uri"]] = kbytes
         iv = key["iv"] or index.to_bytes(16, "big")
         cipher = Cipher(algorithms.AES(kbytes), modes.CBC(iv))
@@ -912,7 +921,12 @@ def _run_job(state: GuiState, job: Job):
     def work():
         job.phase = "queued"
         job.status = "queued — waiting for a free slot"
-        state.sem.acquire()
+        # Interruptible wait for a slot, so Stop on a queued job is honoured at
+        # once instead of after another download frees the semaphore.
+        while not state.sem.acquire(timeout=0.2):
+            if job.stop_event.is_set():
+                job.phase, job.status = "stopped", "stopped"
+                return
         try:
             if job.stop_event.is_set():        # stopped while still queued
                 job.phase, job.status = "stopped", "stopped"
@@ -1029,11 +1043,17 @@ async function start(){
 }
 async function pick(i){ await fetch(q('/select'),{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}); }
-async function stop(id){ await fetch(q('/stop'),{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
-async function resume(id){ await fetch(q('/resume'),{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
+// Optimistic UI: flip the button instantly, then let the backend catch up.
+// `pending` survives the 400ms re-render until the server phase confirms it.
+const pending={};
+function stop(id){ pending[id]='stopping'; renderJobs(lastJobs);
+  fetch(q('/stop'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id})}).catch(()=>{}); }
+function resume(id){ pending[id]='resuming'; renderJobs(lastJobs);
+  fetch(q('/resume'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id})}).catch(()=>{}); }
 let shownChoose=false;
+let lastJobs=[];
 function renderCands(cands){
   if(shownChoose) return; shownChoose=true;
   const box=$('cands'); box.textContent='';
@@ -1056,13 +1076,23 @@ function renderCands(cands){
   });
 }
 function renderJobs(jobs){
+  lastJobs=jobs;
   const box=$('jobs'); box.textContent='';
   jobs.forEach(j=>{
+    // Clear the optimistic flag once the backend has actually transitioned.
+    const p=pending[j.id];
+    if(p==='stopping'&&['stopped','error','done'].includes(j.phase)) delete pending[j.id];
+    if(p==='resuming'&&['queued','downloading','done'].includes(j.phase)) delete pending[j.id];
+    const eff=pending[j.id];
+
     const d=document.createElement('div'); d.className='job';
     const top=document.createElement('div'); top.className='top';
     const t=document.createElement('div'); t.className='ttl'; t.textContent='#'+j.id+'  '+j.title;
     top.appendChild(t);
-    if(j.phase==='queued'||j.phase==='downloading'){
+    if(eff){                       // mid-action: show a disabled button right away
+      const b=document.createElement('button'); b.className='sec'; b.disabled=true;
+      b.textContent=eff==='stopping'?'Stopping…':'Resuming…'; top.appendChild(b);
+    } else if(j.phase==='queued'||j.phase==='downloading'){
       const b=document.createElement('button'); b.className='sec'; b.textContent='Stop';
       b.onclick=()=>stop(j.id); top.appendChild(b);
     } else if(j.phase==='stopped'||j.phase==='error'){
@@ -1073,7 +1103,8 @@ function renderJobs(jobs){
     const fill=document.createElement('div'); fill.className='fill '+j.phase;
     fill.style.width=j.progress.toFixed(1)+'%'; bar.appendChild(fill);
     const st=document.createElement('div'); st.className='st';
-    st.textContent=j.progress.toFixed(1)+'%  '+j.status;
+    const txt=eff==='stopping'?'stopping…':eff==='resuming'?'resuming…':j.status;
+    st.textContent=j.progress.toFixed(1)+'%  '+txt;
     d.append(top,bar,st); box.appendChild(d);
   });
 }
