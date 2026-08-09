@@ -153,9 +153,30 @@ def _fmt_duration(secs: Optional[float]) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _safe_name(name: str) -> str:
+# Linux caps a single path component at 255 *bytes*, not characters: a 150-char
+# CJK title is ~450 bytes and open() fails with ENAMETOOLONG. Budget in bytes and
+# keep headroom for the suffixes appended later — our ".all.ts" join temp file and
+# yt-dlp's ".f137" / ".part-Frag12" intermediates.
+NAME_MAX_BYTES = 255
+NAME_RESERVE_BYTES = 32
+
+
+def _clamp_bytes(text: str, limit: int) -> str:
+    """Truncate to at most *limit* UTF-8 bytes without splitting a character."""
+    return text.encode("utf-8")[:max(0, limit)].decode("utf-8", "ignore").strip()
+
+
+def _safe_name(name: str, reserve: int = NAME_RESERVE_BYTES) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", name or "video").strip()
-    return (name[:150] or "video")
+    return _clamp_bytes(name, NAME_MAX_BYTES - reserve) or "video"
+
+
+def _clamp_path_bytes(path: str, reserve: int = NAME_RESERVE_BYTES) -> str:
+    """Shorten only the stem of *path*'s last component to fit the byte limit."""
+    head, base = os.path.split(path)
+    stem, ext = os.path.splitext(base)
+    stem = _clamp_bytes(stem, NAME_MAX_BYTES - reserve - len(ext.encode("utf-8"))) or "video"
+    return os.path.join(head, stem + ext)
 
 
 # --------------------------------------------------------------------------- #
@@ -638,6 +659,14 @@ def _resolve_hls(cand: Candidate, log) -> tuple[Optional[str], dict, Optional[st
 
 
 # ---- yt-dlp engine (YouTube, DASH, progressive mp4) ----------------------- #
+class _ByteSafeYDL(yt_dlp.YoutubeDL):
+    """yt-dlp trims filenames by character count (`trim_file_name`), which still
+    overflows the 255-byte component limit for non-ASCII titles. Clamp in bytes."""
+
+    def prepare_filename(self, info_dict, *args, **kwargs):
+        return _clamp_path_bytes(super().prepare_filename(info_dict, *args, **kwargs))
+
+
 def _download_ytdlp(cand: Candidate, outdir: str, prog: Progress) -> str:
     final_holder: dict = {}
 
@@ -676,7 +705,7 @@ def _download_ytdlp(cand: Candidate, outdir: str, prog: Progress) -> str:
     }
     prog.on_log("Downloading with yt-dlp (resumable, max resolution)…")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _ByteSafeYDL(ydl_opts) as ydl:
             ydl.download([cand.download_url])
     except StopDownload:
         prog.on_log("Stopped — partial file kept, restart to resume.")
