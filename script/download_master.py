@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-allround_downloader.py — a paste-the-URL video downloader for almost any site.
+download_master.py — a paste-the-URL video downloader for almost any site.
 
 Goals (see project request):
   * Works on general sites incl. YouTube, missav123.com, jable.tv, njavtv.com.
@@ -30,10 +30,10 @@ Engine strategy
   to press play and capture the real stream URL — see _browser_extract.
 
 Usage
-    python allround_downloader.py                 # launch the GUI
-    python allround_downloader.py <URL>           # GUI pre-filled with URL
-    python allround_downloader.py --cli <URL>     # headless download
-    python allround_downloader.py --probe <URL>   # just list detected candidates
+    python download_master.py                 # launch the GUI
+    python download_master.py <URL>           # GUI pre-filled with URL
+    python download_master.py --cli <URL>     # headless download
+    python download_master.py --probe <URL>   # just list detected candidates
 """
 
 from __future__ import annotations
@@ -245,6 +245,15 @@ def probe(url: str, log: Callable[[str], None] = print) -> list[Candidate]:
 
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
+        # The generic extractor scoops up every <video> on the page, so a site
+        # that lines its sidebar with hover-preview clips (xsz-av) yields dozens
+        # of decoys and no main video. Only the generic one needs this: a real
+        # extractor's playlist entries are page URLs, not media.
+        if (info.get("extractor") or "").lower() == "generic":
+            entries = [e for e in entries if not _is_ad_media(e.get("url") or "")]
+            if not entries:
+                log("yt-dlp found only preview clips; scraping page for the real stream…")
+                return _scrape_or_browser(url, log)
         if len(entries) == 1:
             return [_candidate_from_info(entries[0])]
         cands = []
@@ -298,61 +307,20 @@ def _unpack_packed_js(html: str) -> str:
 
 
 def _page_title(html: str) -> Optional[str]:
-    m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html, re.I)
-    if not m:
-        m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+    # Attributes come in any order and framework-rendered pages decorate even
+    # <title> (xsz-av emits `<title q:head="">`), so match loosely.
+    patterns = (
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+        r"<title[^>]*>(.*?)</title>",
+    )
+    m = next((m for m in (re.search(p, html, re.I | re.S) for p in patterns) if m), None)
     if not m:
         return None
     title = re.sub(r"\s+", " ", m.group(1)).strip()
     # drop a trailing " - SiteName" / " | SiteName" suffix (separator must be
     # space-padded, so codes like "DASS-992" are left intact)
     return re.split(r"\s+[|\-–]\s+", title)[0].strip() or title
-
-
-def _scrape_candidates(url: str, log: Callable[[str], None]) -> list[Candidate]:
-    """Last-resort: pull .m3u8 / .mp4 URLs out of the page HTML, including ones
-    hidden inside packed/obfuscated JS (missav/njav embed them that way)."""
-    headers = {"User-Agent": USER_AGENT, "Referer": url}
-    try:
-        html = make_session().get(url, headers=headers, timeout=30).text
-    except Exception as exc:
-        log(f"Could not fetch page: {exc}")
-        return []
-
-    # search the raw HTML *and* any unpacked JS for media URLs
-    text = html + "\n" + _unpack_packed_js(html)
-    found: list[str] = []
-    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:m3u8|mp4)[^\s"\'<>\\]*', text):
-        u = m.group(0)
-        if u not in found:
-            found.append(u)
-    # also catch escaped JSON urls like https:\/\/...
-    for m in re.finditer(r'https?:\\?/\\?/[^\s"\'<>]+?\.(?:m3u8|mp4)', text):
-        u = m.group(0).replace("\\/", "/")
-        if u not in found:
-            found.append(u)
-
-    # If a master HLS playlist is present, prefer it: it auto-selects the best
-    # resolution, so we drop the per-resolution variants and preview clips.
-    masters = [u for u in found if re.search(r"/playlist\.m3u8", u)]
-    if masters:
-        found = masters
-
-    log(f"Scraped {len(found)} media URL(s) from page.")
-    page_title = _page_title(html)
-    cands = []
-    for u in found:
-        ext = "m3u8" if ".m3u8" in u else "mp4"
-        cands.append(
-            Candidate(
-                title=page_title or os.path.basename(urlparse(u).path) or ext,
-                download_url=u,
-                is_ytdlp=False,
-                resolution="HLS" if ext == "m3u8" else "mp4",
-                http_headers={"User-Agent": USER_AGENT, "Referer": url},
-            )
-        )
-    return cands
 
 
 # Hosts that only ever serve ads / trackers / unrelated previews — never the
@@ -368,8 +336,80 @@ _AD_HOSTS = (
 def _is_ad_media(u: str) -> bool:
     if any(a in u for a in _AD_HOSTS):
         return True
-    # tiny banner/preview clips live under sized paths like /300x250/ or /preview
-    return bool(re.search(r"/\d{2,4}x\d{2,4}/|/preview\.mp4", u))
+    # tiny banner/preview clips live under sized paths like /300x250/ or
+    # /preview, and the sidebar's hover clips under /tmb<n>/ (xsz-av) — a page
+    # carries dozens of those and they would bury the one real stream
+    return bool(re.search(r"/\d{2,4}x\d{2,4}/|/preview\.mp4|/tmb\d*/", u))
+
+
+def _media_headers(page_url: str) -> dict:
+    """The headers the site's own player would send. Origin is not optional:
+    xsz-av's segment CDN answers 403 to a request carrying only a Referer."""
+    p = urlparse(page_url)
+    return {"User-Agent": USER_AGENT, "Referer": page_url,
+            "Origin": f"{p.scheme}://{p.netloc}"}
+
+
+def _media_urls(text: str, base: str) -> list[str]:
+    """Media URLs mentioned anywhere in *text*, resolved against *base*: plain,
+    \\/-escaped inside JSON, or root-relative like the <video src="/media/x.m3u8">
+    xsz-av's player points at."""
+    found: list[str] = []
+    patterns = (
+        r'https?://[^\s"\'<>\\]+?\.(?:m3u8|mp4)[^\s"\'<>\\]*',
+        r'https?:\\?/\\?/[^\s"\'<>]+?\.(?:m3u8|mp4)',
+        r'(?<=["\'])/[^\s"\'<>]+?\.(?:m3u8|mp4)[^\s"\'<>]*',
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            u = urljoin(base, m.group(0).replace("\\/", "/"))
+            if u not in found and not _is_ad_media(u):
+                found.append(u)
+    return found
+
+
+def _prefer_stream(urls: list[str]) -> list[str]:
+    """Narrow a mixed bag of media URLs down to the ones that can be the main
+    video: a master playlist if present (it auto-selects the best resolution),
+    else any HLS, else progressive mp4."""
+    m3u8s = [u for u in urls if ".m3u8" in u]
+    masters = [u for u in m3u8s if re.search(r"/(playlist|master|index)\.m3u8", u)]
+    return masters or m3u8s or [u for u in urls if ".mp4" in u]
+
+
+def _make_candidates(urls: list[str], title: Optional[str], page_url: str) -> list[Candidate]:
+    return [
+        Candidate(
+            title=title or os.path.basename(urlparse(u).path) or "video",
+            download_url=u,
+            is_ytdlp=False,
+            resolution="HLS" if ".m3u8" in u else "mp4",
+            http_headers=_media_headers(page_url),
+        )
+        for u in urls
+    ]
+
+
+def _scrape_candidates(url: str, log: Callable[[str], None]) -> list[Candidate]:
+    """Last-resort: pull .m3u8 / .mp4 URLs out of the page HTML, including ones
+    hidden inside packed/obfuscated JS (missav/njav embed them that way)."""
+    try:
+        html = make_session().get(
+            url, headers={"User-Agent": USER_AGENT, "Referer": url}, timeout=30).text
+    except Exception as exc:
+        log(f"Could not fetch page: {exc}")
+        return []
+
+    # Only _cf_chl_opt marks the interstitial itself; Cloudflare injects a
+    # /cdn-cgi/challenge-platform/ script into ordinary pages as well.
+    if "_cf_chl_opt" in html:
+        log("Page is behind a Cloudflare challenge; a browser is needed.")
+        return []
+
+    # search the raw HTML *and* any unpacked JS for media URLs
+    found = _prefer_stream(_media_urls(html + "\n" + _unpack_packed_js(html), url))
+    log(f"Scraped {len(found)} media URL(s) from page.")
+    return _make_candidates(found, _page_title(html), url)
 
 
 def _system_chromium() -> Optional[str]:
@@ -382,6 +422,31 @@ def _system_chromium() -> Optional[str]:
         if path:
             return path
     return None
+
+
+def _wait_out_challenge(page, log: Callable[[str], None], timeout: float = 60.0) -> None:
+    """Cloudflare's managed challenge holds the page for ~10s and then reloads
+    the real one. Touching the DOM before that only ever sees the interstitial,
+    so the player is never found — wait for the challenge to go away first."""
+    deadline = time.time() + timeout
+    announced = False
+    while time.time() < deadline:
+        try:
+            challenged = page.evaluate(
+                "() => !!(window._cf_chl_opt ||"
+                " document.getElementById('challenge-form') ||"
+                " document.getElementById('challenge-running'))")
+        except Exception:
+            challenged = True  # evaluate throws mid-navigation: still settling
+        if not challenged:
+            if announced:
+                log("Cloudflare challenge cleared.")
+            return
+        if not announced:
+            announced = True
+            log("Waiting out a Cloudflare challenge…")
+        page.wait_for_timeout(1000)
+    log("Cloudflare challenge did not clear in time; continuing anyway.")
 
 
 def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
@@ -398,6 +463,7 @@ def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
 
     headed = bool(os.environ.get("DISPLAY"))
     media: list[str] = []
+    dom: list[str] = []
     title_holder: dict[str, str] = {}
 
     def remember(resp):
@@ -441,9 +507,17 @@ def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
             page.on("response", remember)
             log("Browser fallback: loading page…")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            _wait_out_challenge(page, log)
             page.wait_for_timeout(2500)
             try:
                 title_holder["t"] = page.title()
+            except Exception:
+                pass
+            # The rendered DOM is the reliable source: a <video src> is there
+            # whether or not playback ever starts (xsz-av's player is preload=
+            # "none" behind a click-eating overlay, so it may well not).
+            try:
+                dom.extend(_media_urls(page.content(), page.url))
             except Exception:
                 pass
             # Trigger the player: click the page's play button, then nudge any
@@ -469,10 +543,10 @@ def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
             except Exception:
                 pass
 
-    # Prefer a master HLS playlist; otherwise keep m3u8s, else fall back to mp4.
-    m3u8s = [u for u in media if ".m3u8" in u]
-    masters = [u for u in m3u8s if re.search(r"/(playlist|master|index)\.m3u8", u)]
-    chosen = masters or m3u8s or [u for u in media if ".mp4" in u]
+    # DOM hits first: they come from the page's own player element, while the
+    # captured traffic can also hold whatever an ad frame happened to play.
+    found = dom + [u for u in media if u not in dom and not _is_ad_media(u)]
+    chosen = _prefer_stream(found)
     if not chosen:
         log("Browser fallback found no playable stream "
             "(site may have served a decoy to automation).")
@@ -481,16 +555,7 @@ def _browser_extract(url: str, log: Callable[[str], None]) -> list[Candidate]:
     log(f"Browser fallback captured {len(chosen)} stream URL(s).")
     title = re.split(r"\s+[|\-–]\s+", (title_holder.get("t") or "").strip())[0] \
         or _safe_name(os.path.basename(urlparse(url).path))
-    return [
-        Candidate(
-            title=title,
-            download_url=u,
-            is_ytdlp=False,
-            resolution="HLS" if ".m3u8" in u else "mp4",
-            http_headers={"User-Agent": USER_AGENT, "Referer": url},
-        )
-        for u in chosen
-    ]
+    return _make_candidates(chosen, title, url)
 
 
 def _scrape_or_browser(url: str, log: Callable[[str], None]) -> list[Candidate]:
@@ -1318,7 +1383,7 @@ def run_cli(url: str, outdir: str, pick: Optional[int]):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Paste-the-URL allround video downloader.")
+    ap = argparse.ArgumentParser(description="Paste-the-URL video downloader.")
     ap.add_argument("url", nargs="?", help="video URL")
     ap.add_argument("--cli", action="store_true", help="headless download (no GUI)")
     ap.add_argument("--probe", action="store_true", help="list candidates and exit")
