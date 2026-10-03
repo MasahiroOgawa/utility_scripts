@@ -1,5 +1,7 @@
 *~
 downloaded_segments/
+data/
+result/
 .env
 .aider*
 

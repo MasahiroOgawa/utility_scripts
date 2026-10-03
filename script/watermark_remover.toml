@@ -1,0 +1,56 @@
+# Default config for script/watermark_remover.py.
+
+[io]
+# Image paths or glob patterns (relative to the current directory; ** recurses).
+input = ["data/IMG_7675.jpg"]
+# Single output file; valid only when input matches exactly one image.
+# Empty: each result goes to output_dir under the input's file name.
+output = ""
+output_dir = "result"
+jpeg_quality = 95
+
+[detect]
+# "auto" picks the polarity whose response forms the stronger lattice, and
+# assumes light when neither tiles.
+polarity = "auto"            # auto | light | dark
+# Structuring element diameter (px); must exceed the watermark stroke width.
+stroke_kernel = 7
+# Untiled fallback: pixel is a watermark candidate if response > median + k * MAD.
+# Without a lattice there is nothing to tell strokes from fine highlights, so
+# this is strict; lower it to catch more at the cost of real detail.
+threshold_k = 10.0
+# Watermark overlays are near-neutral; skip strongly coloured pixels (Lab chroma).
+max_chroma = 25.0
+# Connected components smaller than this (px) are treated as noise.
+min_component = 4
+
+[lattice]
+enabled = true
+# Shortest repeat distance considered (px); below this the autocorrelation is
+# dominated by stroke texture, not by watermark tiling.
+min_period = 30
+# Normalised autocorrelation a lattice must reach to be trusted.
+min_score = 0.12
+# Template pixel is watermark if |median-stacked high-pass| > k * MAD.
+threshold_k = 4.0
+# Upper bound on the number of shifted copies median-stacked.
+max_copies = 48
+
+[unblend]
+# Pixels whose estimated opacity exceeds this cannot be recovered reliably and
+# are inpainted instead.
+alpha_max = 0.6
+# Mask dilation (px) used when estimating the clean background.
+background_dilate = 3
+
+[residual]
+# Residual response threshold after unblending, in MAD units of the original.
+threshold_k = 6.0
+dilate = 1
+
+[inpaint]
+model = "lama_fp32"
+cache_dir = "~/.cache/watermark_remover"
+tile = 512
+overlap = 64
+feather = 2

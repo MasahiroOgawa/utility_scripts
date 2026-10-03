@@ -5,5 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "numpy>=2.5.3",
+    "onnxruntime>=1.23.2 ; platform_machine != 'x86_64' or sys_platform != 'darwin'",
+    "onnxruntime<1.24 ; platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "opencv-python-headless>=5.0.0.93",
     "requests>=2.32.4",
 ]
